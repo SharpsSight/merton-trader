@@ -6,7 +6,20 @@ read identical settings (anti-drift discipline).
 """
 
 # --- universe -------------------------------------------------------------
-UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "META", "TSLA"]
+# Candidate pool: liquid S&P 500 large-caps across sectors. The runner ranks
+# these by recent dollar-volume at startup and trades the top UNIVERSE_SIZE.
+CANDIDATE_POOL = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "GOOG", "TSLA", "AVGO",
+    "JPM", "V", "MA", "UNH", "HD", "PG", "XOM", "CVX", "LLY", "ABBV", "MRK",
+    "PFE", "KO", "PEP", "COST", "WMT", "DIS", "NFLX", "CRM", "ADBE", "AMD",
+    "INTC", "QCOM", "TXN", "CSCO", "ORCL", "IBM", "BAC", "WFC", "GS", "MS",
+    "C", "AXP", "BA", "CAT", "DE", "GE", "HON", "UPS", "T", "VZ",
+    "TMUS", "CMCSA", "NKE", "MCD", "SBUX", "LOW", "TGT", "PM", "MO", "CVS",
+    "TMO", "ABT", "DHR", "BMY", "AMGN", "GILD", "ISRG", "NOW", "INTU", "MU",
+    "AMAT", "LRCX", "PYPL", "UBER", "ABNB", "PLTR", "COIN", "SHOP", "F", "GM",
+]
+UNIVERSE_SIZE = 50            # trade the top N of the pool by dollar-volume
+UNIVERSE = CANDIDATE_POOL[:8]  # fallback if dynamic selection is unavailable
 MARKET_PROXY = "SPY"          # used by the volatility circuit-breaker
 
 # --- signal / confluence --------------------------------------------------
