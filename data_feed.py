@@ -13,11 +13,12 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 
+BAR_5M = TimeFrame(5, TimeFrameUnit.Minute)
 BAR_15M = TimeFrame(15, TimeFrameUnit.Minute)
 BAR_DAY = TimeFrame.Day
 
 
-def fetch_bars_batch(dc, symbols, days, timeframe=BAR_15M) -> dict:
+def fetch_bars_batch(dc, symbols, days, timeframe=BAR_5M) -> dict:
     """
     One request for MANY symbols. Returns {symbol: DataFrame[o,h,l,c,v]}.
     Symbols with no data are simply absent from the result.
