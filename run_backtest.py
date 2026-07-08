@@ -59,6 +59,7 @@ def main():
 
     all_trades = []
     per_symbol = {}
+    tradeable = []
     for sym in universe:
         try:
             df = frames.get(sym)
@@ -66,10 +67,27 @@ def main():
                 print(f"{sym:6s}: insufficient bars, skipping"); continue
             res = bt.run_backtest(df)
             all_trades.extend(res["trades"])
-            per_symbol[sym] = res["metrics"]
             m = res["metrics"]
-            print(f"{sym:6s}: trades={m['n_trades']:4d} "
-                  f"win={m['win_rate']:.2f} avg_ret={m['avg_ret']:+.4f}")
+
+            # per-symbol worthiness: is the risk-ADJUSTED edge good enough?
+            # ratio = mu_lcb / sigma (confident return per unit of trade risk).
+            rets = np.array([t["ret"] for t in res["trades"]])
+            if len(rets) >= config.MIN_SYMBOL_TRADES:
+                s_mu = float(rets.mean())
+                s_sig = float(rets.std(ddof=1))
+                s_lcb = s_mu - config.LCB_Z * (s_sig / np.sqrt(len(rets)))
+                ratio = s_lcb / s_sig if s_sig > 0 else 0.0
+            else:
+                s_mu = s_sig = s_lcb = ratio = 0.0
+            worthy = ratio >= config.MIN_EDGE_RATIO
+            per_symbol[sym] = {**m, "mu": s_mu, "sigma": s_sig,
+                               "mu_lcb": s_lcb, "edge_ratio": ratio, "worthy": worthy}
+            if worthy:
+                tradeable.append(sym)
+
+            flag = "WORTH IT" if worthy else "skip (risk not justified)"
+            print(f"{sym:6s}: trades={m['n_trades']:4d} win={m['win_rate']:.2f} "
+                  f"avg_ret={m['avg_ret']:+.4f} ratio={ratio:+.3f}  {flag}")
         except Exception as e:
             print(f"{sym:6s}: error {e}")
 
@@ -81,6 +99,7 @@ def main():
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "days": args.days,
         "universe": universe,
+        "tradeable": tradeable,
         "n_trades": len(all_trades),
         "buckets": pooled,
         "per_symbol": per_symbol,
@@ -89,7 +108,9 @@ def main():
         json.dump(payload, f, indent=2)
 
     print(f"\nWrote {config.SIGNAL_STATS_PATH}  ({len(all_trades)} pooled trades, "
-          f"{len(universe)} symbols)")
+          f"{len(tradeable)}/{len(universe)} clear the risk-adjusted bar "
+          f"(ratio >= {config.MIN_EDGE_RATIO}))")
+    print(f"Tradeable: {', '.join(tradeable) or '(none)'}")
     print("Per-bucket edge (what Merton will size on):")
     for k, v in sorted(pooled.items()):
         lcb = v["mu"] - config.LCB_Z * (v["sigma"] / np.sqrt(v["n"])) if v["n"] > 1 else 0.0
