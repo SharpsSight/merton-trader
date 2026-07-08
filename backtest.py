@@ -79,7 +79,8 @@ def build_signal_frame(df15: pd.DataFrame,
 # Backtest
 # --------------------------------------------------------------------------
 def run_backtest(df15: pd.DataFrame,
-                 entry_threshold: float = config.ENTRY_THRESHOLD) -> dict:
+                 entry_threshold: float = config.ENTRY_THRESHOLD,
+                 flatten_eod: bool = False) -> dict:
     sf = build_signal_frame(df15)
     cost = (config.SLIPPAGE_BPS + config.SPREAD_BPS) / 1e4  # per side
 
@@ -90,11 +91,21 @@ def run_backtest(df15: pd.DataFrame,
     o = sf["open"].values
     h = sf["high"].values
     lo = sf["low"].values
+    c = sf["close"].values
     score = sf["score"].values
     st = sf["st"].values
+    dates = sf.index.normalize().values     # for day-boundary detection
     n = len(sf)
 
     for i in range(1, n - 1):
+        # end-of-day flatten: new day + open position -> close at prior day's last close
+        if flatten_eod and pos != 0 and dates[i] != dates[i - 1]:
+            exit_px = c[i - 1] * (1 - pos * cost)
+            trades.append({"entry_score": entry_score, "direction": pos,
+                           "ret": pos * (exit_px - entry_px) / entry_px})
+            pos = 0
+            stop = None
+
         if pos == 0:
             if abs(score[i]) >= entry_threshold:
                 pos = 1 if score[i] > 0 else -1
