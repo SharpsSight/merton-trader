@@ -58,14 +58,10 @@ def build_signal_frame(df15: pd.DataFrame,
     out = df15.join(base[["s15", "st"]])
 
     for rule, col in [("30min", "s30"), ("60min", "s60")]:
-        tf = _resample(df15, rule)
-        sc = _score_series(tf)["score"].rename(col)
-        # align last CLOSED higher-TF bar onto each 15m timestamp (backward)
-        merged = pd.merge_asof(out[[]].reset_index(),
-                               sc.reset_index(), left_on="index",
-                               right_on=sc.index.name or "index",
-                               direction="backward")
-        out[col] = merged[col].values
+           tf = _resample(df15, rule)
+           sc = _score_series(tf)["score"]
+           # align last CLOSED higher-TF bar onto each 15m timestamp (no look-ahead)
+           out[col] = sc.reindex(out.index, method="ffill").values
 
     w15, w30, w60 = weights["15min"], weights["30min"], weights["60min"]
     wsum = w15 + w30 + w60
