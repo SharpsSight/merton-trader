@@ -105,19 +105,20 @@ def _key(*names):
 
 
 def load_stats_and_universe(dc):
-    """Load bucket stats + the universe the backtest chose. Fallback to a
-    fresh selection if the file is missing (observe mode) or lacks a universe."""
+    """Load bucket stats + the universe + the tradeable (worthy) subset the
+    backtest chose. Fallback to a fresh selection if the file is missing."""
     try:
         with open(config.SIGNAL_STATS_PATH) as f:
             payload = json.load(f)
         stats = payload.get("buckets", {})
         universe = payload.get("universe") or feed.select_universe(
             dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) or config.UNIVERSE
-        return stats, universe
+        tradeable = set(payload.get("tradeable") or universe)
+        return stats, universe, tradeable
     except FileNotFoundError:
         universe = feed.select_universe(
             dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) or config.UNIVERSE
-        return None, universe
+        return None, universe, set(universe)
 
 
 def current_positions(tc):
@@ -140,13 +141,13 @@ def run():
     except Exception as e:
         log.error("Auth failed (paper keys?): %s", e); sys.exit(1)
 
-    stats, universe = load_stats_and_universe(dc)
+    stats, universe, tradeable = load_stats_and_universe(dc)
     mode = "TRADE" if stats else "OBSERVE"
     start_equity = float(acct.equity)
     rm = RiskManager(start_equity)
 
-    log.info("=== live_paper starting | mode=%s | equity $%s | universe=%d ===",
-             mode, f"{start_equity:,.2f}", len(universe))
+    log.info("=== live_paper starting | mode=%s | equity $%s | universe=%d | tradeable=%d ===",
+             mode, f"{start_equity:,.2f}", len(universe), len(tradeable))
     if mode == "OBSERVE":
         log.info("No signal_stats.json -> OBSERVE mode: logging signals, NOT trading. "
                  "Run run_backtest.py to enable sizing.")
@@ -216,6 +217,10 @@ def run():
 
                     # --- entries (ENTER, or the enter-leg of FLIP) ---
                     if sig["direction"] == 0:
+                        continue
+                    # per-symbol worthiness: only ENTER names whose own edge
+                    # cleared the LCB in the backtest. (Held names still exit above.)
+                    if sym not in tradeable:
                         continue
                     conf = fac.confirmation(df, sig["direction"])
                     bucket = _bucket(sig["score"])
