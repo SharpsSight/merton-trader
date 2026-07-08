@@ -19,67 +19,67 @@ import math
 import config
 
 
-def merton_fraction(mu: float, sigma: float, n: int,
+def merton_fraction(mu: float, bucket_sigma: float, n: int, symbol_vol: float,
                     gamma: float = config.GAMMA,
                     fractional: float = config.FRACTIONAL,
                     z: float = config.LCB_Z,
                     max_fraction: float = config.MAX_FRACTION) -> float:
     """
-    Return the fraction of equity to allocate (>= 0). Direction is applied
-    separately by the caller. Returns 0 when the edge isn't statistically
-    positive or inputs are degenerate.
+    Fraction of equity to allocate (>= 0). Two separate roles:
+      - EDGE + confidence: bucket mu, bucket_sigma, n -> mu_lcb (do we trade?)
+      - RISK scaling:      symbol_vol -> inverse-variance sizing (how much?)
+    So two stocks in the same signal bucket but different volatility get
+    DIFFERENT sizes: the more volatile one gets less. Returns 0 when the edge
+    isn't statistically positive.
     """
-    if n < 2 or sigma <= 0 or not math.isfinite(mu) or not math.isfinite(sigma):
+    if (n < 2 or bucket_sigma <= 0 or symbol_vol <= 0
+            or not math.isfinite(mu) or not math.isfinite(symbol_vol)):
         return 0.0
 
-    mu_lcb = mu - z * (sigma / math.sqrt(n))   # shrink for small-sample uncertainty
+    mu_lcb = mu - z * (bucket_sigma / math.sqrt(n))   # edge uncertainty shrink
     if mu_lcb <= 0:
-        return 0.0                              # edge not credibly positive -> flat
+        return 0.0                                     # edge not credible -> flat
 
-    f = fractional * mu_lcb / (gamma * sigma ** 2)
+    f = fractional * mu_lcb / (gamma * symbol_vol ** 2)  # risk-adjusted by asset vol
     return max(0.0, min(f, max_fraction))
 
 
 def size_position(equity: float, price: float, direction: int,
-                  stats: dict, confirmation_mult: float = 1.0,
+                  stats: dict, symbol_vol: float, confirmation_mult: float = 1.0,
                   params: dict | None = None) -> dict:
     """
-    Convert a signal into an order intent.
+    Convert a signal into an order intent, risk-adjusted by the symbol's own
+    volatility.
 
-    equity           : account equity
-    price            : current price
-    direction        : +1 long / -1 short / 0 flat
-    stats            : {'mu':..., 'sigma':..., 'n':...} for this signal bucket
-    confirmation_mult: factor multiplier in [0.5,1.0] (attenuates size)
-
-    Returns {'shares', 'fraction', 'notional', 'mu_lcb', 'direction'}.
+    stats       : {'mu','sigma','n'} for this signal bucket (edge estimate)
+    symbol_vol  : this symbol's realized return volatility over the holding
+                  horizon (the risk denominator)
     """
     params = params or {}
-    if direction == 0 or price <= 0 or equity <= 0:
+    if direction == 0 or price <= 0 or equity <= 0 or symbol_vol <= 0:
         return _empty(direction)
 
     mu = float(stats.get("mu", 0.0))
-    sigma = float(stats.get("sigma", 0.0))
+    bucket_sigma = float(stats.get("sigma", 0.0))
     n = int(stats.get("n", 0))
 
     frac = merton_fraction(
-        mu, sigma, n,
+        mu, bucket_sigma, n, symbol_vol,
         gamma=params.get("gamma", config.GAMMA),
         fractional=params.get("fractional", config.FRACTIONAL),
         z=params.get("z", config.LCB_Z),
         max_fraction=params.get("max_fraction", config.MAX_FRACTION),
     )
-    frac *= max(0.0, min(1.0, confirmation_mult))   # factor attenuation
+    frac *= max(0.0, min(1.0, confirmation_mult))
     if frac <= 0:
         return _empty(direction)
 
     notional = frac * equity
-    shares = int(notional // price) * direction     # signed; floor to whole shares
+    shares = int(notional // price) * direction
     if shares == 0:
         return _empty(direction)
 
-    # recompute mu_lcb for reporting/diagnostics
-    mu_lcb = mu - config.LCB_Z * (sigma / math.sqrt(n)) if n >= 2 and sigma > 0 else 0.0
+    mu_lcb = mu - config.LCB_Z * (bucket_sigma / math.sqrt(n)) if n >= 2 and bucket_sigma > 0 else 0.0
     return {"shares": shares, "fraction": frac, "notional": abs(shares) * price,
             "mu_lcb": mu_lcb, "direction": direction}
 
