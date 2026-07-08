@@ -37,12 +37,54 @@ from backtest import _bucket
 from risk_manager import RiskManager, NORMAL
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import (MarketOrderRequest, StopOrderRequest,
+                                      GetOrdersRequest)
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
+
+
+def plan_symbol(direction, score, held_dir, entry_threshold):
+    """ENTER / EXIT / FLIP / HOLD / NONE — pure position-decision logic."""
+    weak = (direction == 0) or (abs(score) < entry_threshold)
+    if held_dir == 0:
+        return "NONE" if weak else "ENTER"
+    if weak:
+        return "EXIT"
+    if direction != held_dir:
+        return "FLIP"
+    return "HOLD"
+
+
+def cancel_symbol_orders(tc, symbol):
+    """Cancel any open (e.g. protective stop) orders for a symbol."""
+    try:
+        open_orders = tc.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.OPEN, symbols=[symbol]))
+        for o in open_orders:
+            tc.cancel_order_by_id(o.id)
+    except Exception as e:
+        log.warning("  %s cancel-orders failed: %s", symbol, e)
+
+
+def place_entry_with_stop(tc, rm, symbol, approved, price, sig):
+    """Submit the entry market order, then a protective stop on the opposite side."""
+    side = OrderSide.BUY if approved > 0 else OrderSide.SELL
+    tc.submit_order(MarketOrderRequest(symbol=symbol, qty=abs(approved),
+                                       side=side, time_in_force=TimeInForce.DAY))
+    direction = 1 if approved > 0 else -1
+    stop_px = rm.compute_stop(price, direction, sig["stops"])
+    if stop_px:
+        stop_side = OrderSide.SELL if approved > 0 else OrderSide.BUY
+        try:
+            tc.submit_order(StopOrderRequest(
+                symbol=symbol, qty=abs(approved), side=stop_side,
+                time_in_force=TimeInForce.DAY, stop_price=round(float(stop_px), 2)))
+        except Exception as e:
+            log.warning("  %s stop placement failed: %s", symbol, e)
+    return side, stop_px
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -144,22 +186,41 @@ def run():
             log.info("HEARTBEAT | %s | equity $%s | positions=%d | breaker=%s",
                      mode, f"{equity:,.2f}", len(positions), breaker)
 
+            # news overlay action (market-wide breaker for now)
+            action, reason = (no.news_risk_action({}, True) if breaker
+                              else (NORMAL, "clear"))
+
             for sym in config.UNIVERSE:
                 try:
                     df = fetch_15m(dc, sym)
                     if df is None or len(df) < 60:
                         continue
                     sig = ts.confluence_signal(df)
+                    price = float(df["close"].iloc[-1])
+
+                    held = positions.get(sym, {}).get("shares", 0)
+                    held_dir = 1 if held > 0 else (-1 if held < 0 else 0)
+                    plan = plan_symbol(sig["direction"], sig["score"], held_dir,
+                                       config.ENTRY_THRESHOLD)
+
+                    # --- manage existing positions (exits happen even in TRADE-only) ---
+                    if plan in ("EXIT", "FLIP"):
+                        cancel_symbol_orders(tc, sym)          # clear protective stop
+                        tc.close_position(sym)                 # flatten
+                        log.info("  [CLOSE] %-5s %s (held %+d) score=%+.2f",
+                                 sym, plan, held, sig["score"])
+                        positions.pop(sym, None)
+                        if plan == "EXIT":
+                            continue                            # done; no re-entry
+                        held_dir = 0                            # FLIP falls through to enter
+
+                    if plan == "HOLD":
+                        continue
+
+                    # --- entries (ENTER, or the enter-leg of FLIP) ---
                     if sig["direction"] == 0:
                         continue
                     conf = fac.confirmation(df, sig["direction"])
-
-                    # news overlay (best-effort; feed hiccup -> NORMAL)
-                    action, reason = NORMAL, "clear"
-                    if breaker:
-                        action, reason = no.news_risk_action({}, True)
-
-                    price = float(df["close"].iloc[-1])
                     bucket = _bucket(sig["score"])
                     bstats = (stats or {}).get(bucket, {"mu": 0, "sigma": 0, "n": 0})
                     intent = merton.size_position(equity, price, sig["direction"],
@@ -178,12 +239,11 @@ def run():
                         log.info("  [gate] %-5s blocked: %s (news=%s)", sym, gate, reason)
                         continue
 
-                    side = OrderSide.BUY if approved > 0 else OrderSide.SELL
-                    tc.submit_order(MarketOrderRequest(
-                        symbol=sym, qty=abs(approved), side=side,
-                        time_in_force=TimeInForce.DAY))
-                    log.info("  [ORDER] %-5s %s %d @ ~%.2f score=%+.2f bucket=%s",
-                             sym, side.value, abs(approved), price, sig["score"], bucket)
+                    side, stop_px = place_entry_with_stop(tc, rm, sym, approved, price, sig)
+                    log.info("  [ORDER] %-5s %s %d @ ~%.2f stop=%s score=%+.2f bucket=%s",
+                             sym, side.value, abs(approved),
+                             price, f"{stop_px:.2f}" if stop_px else "none",
+                             sig["score"], bucket)
                 except Exception as e:
                     log.warning("  %s error: %s", sym, e)
 
