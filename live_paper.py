@@ -71,20 +71,36 @@ def cancel_symbol_orders(tc, symbol):
 
 
 def place_entry_with_stop(tc, rm, symbol, approved, price, sig):
-    """Submit the entry market order, then a TRAILING stop on the opposite side.
-    The trailing stop follows favourable moves (locking gains) and triggers when
-    the trend reverses by TRAIL_PERCENT — i.e. sells when profit turns down."""
+    """Submit the entry market order, then a GTC TRAILING stop on the opposite
+    side. GTC so protection PERSISTS overnight (a DAY stop expires at 4pm,
+    leaving multi-day holds naked). Trails favourable moves; triggers on reversal."""
     side = OrderSide.BUY if approved > 0 else OrderSide.SELL
     tc.submit_order(MarketOrderRequest(symbol=symbol, qty=abs(approved),
                                        side=side, time_in_force=TimeInForce.DAY))
-    stop_side = OrderSide.SELL if approved > 0 else OrderSide.BUY
+    place_trailing_stop(tc, symbol, abs(approved), approved > 0)
+    return side
+
+
+def place_trailing_stop(tc, symbol, qty, is_long):
+    """Place a GTC trailing stop protecting a position (opposite side)."""
+    stop_side = OrderSide.SELL if is_long else OrderSide.BUY
     try:
         tc.submit_order(TrailingStopOrderRequest(
-            symbol=symbol, qty=abs(approved), side=stop_side,
-            time_in_force=TimeInForce.DAY, trail_percent=config.TRAIL_PERCENT))
+            symbol=symbol, qty=abs(int(qty)), side=stop_side,
+            time_in_force=TimeInForce.GTC, trail_percent=config.TRAIL_PERCENT))
     except Exception as e:
         log.warning("  %s trailing-stop failed: %s", symbol, e)
-    return side
+
+
+def open_order_symbols(tc):
+    """Symbols with a currently open order (e.g. a live protective stop)."""
+    try:
+        return {o.symbol for o in tc.get_orders(
+            filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))}
+    except Exception as e:
+        log.warning("open-orders check failed: %s", e)
+        return set()
+
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -165,9 +181,27 @@ def run():
             equity = float(acct.equity)
             positions = current_positions(tc)
 
+            # end-of-day flatten (optional): close everything near the close and
+            # skip the rest of the cycle so nothing is carried overnight.
+            if config.FLATTEN_EOD:
+                secs_to_close = (clock.next_close - now).total_seconds()
+                if 0 < secs_to_close <= config.FLATTEN_BUFFER_MIN * 60:
+                    for s in list(positions.keys()):
+                        cancel_symbol_orders(tc, s)
+                        try:
+                            tc.close_position(s)
+                        except Exception as e:
+                            log.warning("  %s EOD close failed: %s", s, e)
+                    log.info("EOD FLATTEN | closed %d positions | %.0f min to close",
+                             len(positions), secs_to_close / 60)
+                    time.sleep(OPEN_POLL_SECONDS); continue
+
             # ONE batched fetch for the whole universe + market proxy
             frames = feed.fetch_bars_batch(dc, universe + [config.MARKET_PROXY],
                                            FETCH_DAYS)
+
+            # which held positions currently have a live protective (stop) order?
+            protected = open_order_symbols(tc)
 
             # market-level volatility circuit-breaker (macro shocks)
             breaker = False
@@ -213,6 +247,12 @@ def run():
                         held_dir = 0                            # FLIP falls through to enter
 
                     if plan == "HOLD":
+                        # ensure the held position still has a live protective stop
+                        # (e.g. an old DAY stop expired). Re-arm if missing.
+                        if held != 0 and sym not in protected:
+                            place_trailing_stop(tc, sym, abs(held), held > 0)
+                            log.info("  [PROTECT] %-5s re-armed trailing stop (held %+d)",
+                                     sym, held)
                         continue
 
                     # --- entries (ENTER, or the enter-leg of FLIP) ---
