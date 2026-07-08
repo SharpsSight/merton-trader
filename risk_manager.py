@@ -1,5 +1,5 @@
 """
-risk_manager.py — the last gate before an order is sent.
+risk_manager.py — the last gate before an order is sent
 
 Enforces, in order:
   1. Kill switch / news action (HALT, FLATTEN, REDUCE)
