@@ -79,9 +79,10 @@ def main():
                 ratio = s_lcb / s_sig if s_sig > 0 else 0.0
             else:
                 s_mu = s_sig = s_lcb = ratio = 0.0
-            worthy = ratio >= config.MIN_EDGE_RATIO
-            per_symbol[sym] = {**m, "mu": s_mu, "sigma": s_sig,
-                               "mu_lcb": s_lcb, "edge_ratio": ratio, "worthy": worthy}
+            worthy = bool(ratio >= config.MIN_EDGE_RATIO)
+            per_symbol[sym] = {**m, "mu": float(s_mu), "sigma": float(s_sig),
+                               "mu_lcb": float(s_lcb), "edge_ratio": float(ratio),
+                               "worthy": worthy}
             if worthy:
                 tradeable.append(sym)
 
@@ -105,7 +106,7 @@ def main():
         "per_symbol": per_symbol,
     }
     with open(config.SIGNAL_STATS_PATH, "w") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(payload, f, indent=2, default=float)   # default=float: never choke on numpy types
 
     print(f"\nWrote {config.SIGNAL_STATS_PATH}  ({len(all_trades)} pooled trades, "
           f"{len(tradeable)}/{len(universe)} clear the risk-adjusted bar "
