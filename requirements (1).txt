@@ -1,8 +1,2 @@
-# Core dependencies for the Merton trading scaffold.
-# Install locally tonight with:  pip install -r requirements.txt
-
-alpaca-py>=0.42        # broker + market data SDK (current official Alpaca SDK)
-pandas>=2.0            # bar/series handling
-numpy>=1.26            # numerics
-scipy>=1.11            # Welch t-test, Levene, KS tests for the diagnostics module
-python-dotenv>=1.0     # load API keys from a local .env (which .gitignore excludes)
+alpaca-py>=0.42
+python-dotenv>=1.0
