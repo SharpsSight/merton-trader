@@ -40,8 +40,12 @@ HOLD_BARS = 24               # ~expected holding horizon (5m bars) for vol scali
 
 # --- risk manager ---------------------------------------------------------
 MAX_GROSS_EXPOSURE = 1.0      # sum |position value| <= this * equity (no leverage)
-MAX_POSITIONS = 10
+MAX_POSITIONS = None          # no count cap: worthiness + gross exposure decide breadth
 PER_SYMBOL_CAP = 0.10         # max fraction of equity per symbol
+MIN_SYMBOL_TRADES = 30        # min backtest trades to judge a symbol's own edge
+MIN_EDGE_RATIO = 0.05         # worthiness bar: mu_lcb / sigma (return per unit risk).
+                              # Higher = stricter. A symbol is traded only if its
+                              # risk-adjusted edge clears this, not just mu_lcb > 0.
 DAILY_LOSS_HALT = 0.03        # halt new entries if day PnL <= -3% of start equity
 TRAIL_PERCENT = 2.5          # trailing-stop distance (%) — locks gains, cuts losers
 STOP_ATR_MULT = 2.0          # fallback stop distance if no indicator stop
