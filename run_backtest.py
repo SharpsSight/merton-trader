@@ -25,6 +25,7 @@ except ImportError:
 import numpy as np
 import config
 import backtest as bt
+import data_feed as feed
 
 
 def _key(*names):
@@ -33,24 +34,6 @@ def _key(*names):
         if v:
             return v
     return None
-
-
-def fetch_15m(dc, symbol, days):
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-    from alpaca.data.enums import DataFeed
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame(15, TimeFrameUnit.Minute),
-        start=datetime.now(timezone.utc) - timedelta(days=days),
-        feed=DataFeed.IEX,
-    )
-    df = dc.get_stock_bars(req).df
-    if df is None or len(df) == 0:
-        return None
-    if df.index.nlevels > 1:                   # single-symbol requests return unnamed levels
-        df = df.xs(symbol, level=0)            # key by position, not name
-    return df[["open", "high", "low", "close", "volume"]]
 
 
 def main():
@@ -66,11 +49,19 @@ def main():
     from alpaca.data.historical import StockHistoricalDataClient
     dc = StockHistoricalDataClient(api_key, secret)
 
+    # pick the top-N most liquid names, then ONE batched fetch for all of them
+    universe = feed.select_universe(dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE)
+    if not universe:
+        print("Universe selection returned nothing; falling back."); universe = config.UNIVERSE
+    print(f"Universe ({len(universe)} by dollar-volume): {', '.join(universe)}\n")
+
+    frames = feed.fetch_bars_batch(dc, universe, args.days)
+
     all_trades = []
     per_symbol = {}
-    for sym in config.UNIVERSE:
+    for sym in universe:
         try:
-            df = fetch_15m(dc, sym, args.days)
+            df = frames.get(sym)
             if df is None or len(df) < 300:
                 print(f"{sym:6s}: insufficient bars, skipping"); continue
             res = bt.run_backtest(df)
@@ -89,6 +80,7 @@ def main():
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "days": args.days,
+        "universe": universe,
         "n_trades": len(all_trades),
         "buckets": pooled,
         "per_symbol": per_symbol,
@@ -96,7 +88,8 @@ def main():
     with open(config.SIGNAL_STATS_PATH, "w") as f:
         json.dump(payload, f, indent=2)
 
-    print(f"\nWrote {config.SIGNAL_STATS_PATH}  ({len(all_trades)} pooled trades)")
+    print(f"\nWrote {config.SIGNAL_STATS_PATH}  ({len(all_trades)} pooled trades, "
+          f"{len(universe)} symbols)")
     print("Per-bucket edge (what Merton will size on):")
     for k, v in sorted(pooled.items()):
         lcb = v["mu"] - config.LCB_Z * (v["sigma"] / np.sqrt(v["n"])) if v["n"] > 1 else 0.0
