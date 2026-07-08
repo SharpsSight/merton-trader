@@ -119,33 +119,63 @@ def main():
         print(f"  {k:9s} mu={v['mu']:+.4f} sigma={v['sigma']:.4f} n={v['n']:4d} "
               f"mu_lcb={lcb:+.4f}  {flag}")
 
-    # --- overnight decision: hold-through vs flatten-EOD, on the tradeable set ---
-    def _agg(flatten):
-        rets = []
-        for sym in tradeable:
-            df = frames.get(sym)
-            if df is None or len(df) < 300:
-                continue
-            rets += [t["ret"] for t in bt.run_backtest(df, flatten_eod=flatten)["trades"]]
-        a = np.array(rets)
-        if len(a) == 0:
-            return None
-        sharpe = float(a.mean() / a.std(ddof=1)) if a.std(ddof=1) > 0 else 0.0
-        return {"n": len(a), "total": float(a.sum()), "avg": float(a.mean()),
-                "sharpe": sharpe, "win": float((a > 0).mean())}
+    # --- exit-rule comparison on the tradeable set (signals built once) -------
+    import pandas as pd
+    sfs = {}
+    for sym in tradeable:
+        df = frames.get(sym)
+        if df is not None and len(df) >= 300:
+            sfs[sym] = bt.build_signal_frame(df)
 
-    hold, flat = _agg(False), _agg(True)
-    print("\n=== Overnight decision: HOLD-THROUGH vs FLATTEN-EOD (tradeable set) ===")
-    if hold and flat:
-        print(f"{'mode':14s} {'trades':>7s} {'total_ret':>10s} {'avg/trade':>10s} "
-              f"{'risk-adj':>9s} {'win':>6s}")
-        for name, r in [("hold-through", hold), ("flatten-EOD", flat)]:
-            print(f"{name:14s} {r['n']:7d} {r['total']:+10.3f} {r['avg']:+10.4f} "
-                  f"{r['sharpe']:+9.3f} {r['win']:6.2f}")
-        better = "HOLD-THROUGH" if hold["sharpe"] >= flat["sharpe"] else "FLATTEN-EOD"
-        print(f"-> Better risk-adjusted (per-trade Sharpe): {better}. "
-              f"Currently running: {'FLATTEN-EOD' if config.FLATTEN_EOD else 'HOLD-THROUGH'}. "
-              f"Set config.FLATTEN_EOD accordingly.")
+    variants = {
+        "current (2.5% blend)": dict(trail=0.025, sensitive=False),
+        "tight (1.5% blend)":   dict(trail=0.015, sensitive=False),
+        "sensitive (2.5% 5m)":  dict(trail=0.025, sensitive=True),
+        "both (1.5% 5m)":       dict(trail=0.015, sensitive=True),
+    }
+
+    def evaluate(trail, sensitive):
+        rows = []  # (exit_date, ret)
+        for sf in sfs.values():
+            for t in bt._simulate(sf, config.ENTRY_THRESHOLD, config.FLATTEN_EOD,
+                                  trail, sensitive):
+                rows.append((pd.Timestamp(t["exit_time"]).normalize(), t["ret"]))
+        if not rows:
+            return None
+        r = np.array([x[1] for x in rows])
+        # daily P&L series (equal-weight across trades that closed that day)
+        daily = pd.Series([x[1] for x in rows],
+                          index=[x[0] for x in rows]).groupby(level=0).sum()
+        d = daily.values
+        return {
+            "n": len(r), "total": float(r.sum()), "avg": float(r.mean()),
+            "sharpe": float(r.mean() / r.std(ddof=1)) if r.std(ddof=1) > 0 else 0.0,
+            "win": float((r > 0).mean()),
+            "worst_day": float(d.min()) if len(d) else 0.0,
+            "pct_down_days": float((d < 0).mean()) if len(d) else 0.0,
+        }
+
+    print("\n=== Exit-rule comparison (tradeable set) ===")
+    print(f"{'variant':22s} {'trades':>6s} {'total':>8s} {'risk-adj':>9s} "
+          f"{'win':>5s} {'worstday':>9s} {'down-days':>9s}")
+    results = {}
+    for name, p in variants.items():
+        res = evaluate(p["trail"], p["sensitive"])
+        results[name] = res
+        if res:
+            print(f"{name:22s} {res['n']:6d} {res['total']:+8.2f} {res['sharpe']:+9.3f} "
+                  f"{res['win']:5.2f} {res['worst_day']:+9.3f} {res['pct_down_days']:9.2f}")
+
+    valid = {k: v for k, v in results.items() if v}
+    if valid:
+        best_ret = max(valid, key=lambda k: valid[k]["sharpe"])
+        best_pain = min(valid, key=lambda k: valid[k]["worst_day"] * -1)  # least-bad worst day
+        print(f"\n-> Best risk-adjusted return: {best_ret}")
+        print(f"-> Smallest worst-day drawdown: {best_pain}")
+        print(f"-> Currently running: trail={config.TRAIL_PERCENT}% "
+              f"sensitive_exit={config.SENSITIVE_EXIT}")
+        print("   Tighter exits that DON'T lower risk-adj return are free wins; "
+              "if they cut risk-adj return, that's the whipsaw tax — hold current.")
 
 
 if __name__ == "__main__":
