@@ -1,0 +1,6 @@
+# Full stack dependencies. Install: pip install -r requirements.txt
+alpaca-py>=0.42        # broker + market data + news SDK
+python-dotenv>=1.0     # load API keys from local .env
+pandas>=2.2            # bars, indicators, backtest
+numpy>=1.26            # numerics
+# scipy added later, only when the weekly diagnostics module (Welch/Levene/KS) lands
