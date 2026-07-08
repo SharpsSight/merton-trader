@@ -52,22 +52,26 @@ def _resample(df, rule):
 
 def build_signal_frame(df15: pd.DataFrame,
                        weights: dict = None) -> pd.DataFrame:
-    """Per-15m-bar combined confluence score with no look-ahead."""
+    """Per-base-bar combined confluence score with no look-ahead. Base timeframe
+    is the FIRST key in the weights; the rest are resampled up from it."""
     weights = weights or config.TIMEFRAME_WEIGHTS
-    base = _score_series(df15).rename(columns={"score": "s15"})
-    out = df15.join(base[["s15", "st"]])
+    tfs = list(weights.keys())
+    base_tf = tfs[0]
 
-    for rule, col in [("30min", "s30"), ("60min", "s60")]:
-           tf = _resample(df15, rule)
-           sc = _score_series(tf)["score"]
-           # align last CLOSED higher-TF bar onto each 15m timestamp (no look-ahead)
-           out[col] = sc.reindex(out.index, method="ffill").values
+    base = _score_series(df15)
+    out = df15.join(base[["st"]])
+    combined = weights[base_tf] * base["score"].fillna(0)
+    wsum = weights[base_tf]
 
-    w15, w30, w60 = weights["15min"], weights["30min"], weights["60min"]
-    wsum = w15 + w30 + w60
-    out["score"] = (w15 * out["s15"].fillna(0)
-                    + w30 * out["s30"].fillna(0)
-                    + w60 * out["s60"].fillna(0)) / wsum
+    for tf in tfs[1:]:
+        tf_df = _resample(df15, tf)
+        sc = _score_series(tf_df)["score"]
+        # align last CLOSED higher-TF bar onto each base timestamp (no look-ahead)
+        aligned = sc.reindex(out.index, method="ffill").fillna(0)
+        combined = combined + weights[tf] * aligned
+        wsum += weights[tf]
+
+    out["score"] = combined / wsum if wsum else 0.0
     return out
 
 
