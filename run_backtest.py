@@ -48,8 +48,8 @@ def fetch_15m(dc, symbol, days):
     df = dc.get_stock_bars(req).df
     if df is None or len(df) == 0:
         return None
-    if "symbol" in df.index.names:            # drop symbol level of MultiIndex
-        df = df.xs(symbol, level="symbol")
+    if df.index.nlevels > 1:                   # single-symbol requests return unnamed levels
+        df = df.xs(symbol, level=0)            # key by position, not name
     return df[["open", "high", "low", "close", "volume"]]
 
 
