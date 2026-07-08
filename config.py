@@ -48,6 +48,7 @@ MIN_EDGE_RATIO = 0.05         # worthiness bar: mu_lcb / sigma (return per unit 
                               # risk-adjusted edge clears this, not just mu_lcb > 0.
 DAILY_LOSS_HALT = 0.03        # halt new entries if day PnL <= -3% of start equity
 TRAIL_PERCENT = 2.5          # trailing-stop distance (%) — locks gains, cuts losers
+SENSITIVE_EXIT = False        # True = exit on fast (5m) flip; False = on blended flip
 STOP_ATR_MULT = 2.0          # fallback stop distance if no indicator stop
 STOP_METHOD = "supertrend"    # 'supertrend' | 'psar' | 'atr'
 
