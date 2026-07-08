@@ -73,8 +73,9 @@ class RiskManager:
 
         direction = 1 if desired_shares > 0 else -1
 
-        # max concurrent positions (new symbols only)
-        if symbol not in positions and len(positions) >= self.max_positions:
+        # max concurrent positions (new symbols only); None disables the cap
+        if (self.max_positions and symbol not in positions
+                and len(positions) >= self.max_positions):
             return 0, "max_positions"
 
         # news REDUCE -> halve intended size
