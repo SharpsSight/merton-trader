@@ -1,0 +1,27 @@
+# --- secrets: NEVER commit these ---
+.env
+.env.*
+*.key
+secrets.*
+credentials.*
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# --- data / logs / run artifacts (regenerated, not source) ---
+data/
+logs/
+*.log
+*.parquet
+*.sqlite
+
+# --- os / editor cruft ---
+.DS_Store
+.vscode/
+.idea/
