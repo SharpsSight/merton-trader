@@ -65,7 +65,7 @@ def main():
             df = frames.get(sym)
             if df is None or len(df) < 300:
                 print(f"{sym:6s}: insufficient bars, skipping"); continue
-            res = bt.run_backtest(df)
+            res = bt.run_backtest(df, flatten_eod=config.FLATTEN_EOD)
             all_trades.extend(res["trades"])
             m = res["metrics"]
 
@@ -118,6 +118,34 @@ def main():
         flag = "SIZES" if lcb > 0 else "-> 0 (LCB not positive)"
         print(f"  {k:9s} mu={v['mu']:+.4f} sigma={v['sigma']:.4f} n={v['n']:4d} "
               f"mu_lcb={lcb:+.4f}  {flag}")
+
+    # --- overnight decision: hold-through vs flatten-EOD, on the tradeable set ---
+    def _agg(flatten):
+        rets = []
+        for sym in tradeable:
+            df = frames.get(sym)
+            if df is None or len(df) < 300:
+                continue
+            rets += [t["ret"] for t in bt.run_backtest(df, flatten_eod=flatten)["trades"]]
+        a = np.array(rets)
+        if len(a) == 0:
+            return None
+        sharpe = float(a.mean() / a.std(ddof=1)) if a.std(ddof=1) > 0 else 0.0
+        return {"n": len(a), "total": float(a.sum()), "avg": float(a.mean()),
+                "sharpe": sharpe, "win": float((a > 0).mean())}
+
+    hold, flat = _agg(False), _agg(True)
+    print("\n=== Overnight decision: HOLD-THROUGH vs FLATTEN-EOD (tradeable set) ===")
+    if hold and flat:
+        print(f"{'mode':14s} {'trades':>7s} {'total_ret':>10s} {'avg/trade':>10s} "
+              f"{'risk-adj':>9s} {'win':>6s}")
+        for name, r in [("hold-through", hold), ("flatten-EOD", flat)]:
+            print(f"{name:14s} {r['n']:7d} {r['total']:+10.3f} {r['avg']:+10.4f} "
+                  f"{r['sharpe']:+9.3f} {r['win']:6.2f}")
+        better = "HOLD-THROUGH" if hold["sharpe"] >= flat["sharpe"] else "FLATTEN-EOD"
+        print(f"-> Better risk-adjusted (per-trade Sharpe): {better}. "
+              f"Currently running: {'FLATTEN-EOD' if config.FLATTEN_EOD else 'HOLD-THROUGH'}. "
+              f"Set config.FLATTEN_EOD accordingly.")
 
 
 if __name__ == "__main__":
