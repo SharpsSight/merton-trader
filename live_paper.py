@@ -33,6 +33,7 @@ import trend_signals as ts
 import factors as fac
 import merton
 import news_overlay as no
+import data_feed as feed
 from backtest import _bucket
 from risk_manager import RiskManager, NORMAL
 
@@ -104,27 +105,20 @@ def _key(*names):
     return None
 
 
-def load_stats():
+def load_stats_and_universe(dc):
+    """Load bucket stats + the universe the backtest chose. Fallback to a
+    fresh selection if the file is missing (observe mode) or lacks a universe."""
     try:
         with open(config.SIGNAL_STATS_PATH) as f:
-            return json.load(f).get("buckets", {})
+            payload = json.load(f)
+        stats = payload.get("buckets", {})
+        universe = payload.get("universe") or feed.select_universe(
+            dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) or config.UNIVERSE
+        return stats, universe
     except FileNotFoundError:
-        return None
-
-
-def fetch_15m(dc, symbol):
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame(15, TimeFrameUnit.Minute),
-        start=datetime.now(timezone.utc) - timedelta(days=FETCH_DAYS),
-        feed=DataFeed.IEX,
-    )
-    df = dc.get_stock_bars(req).df
-    if df is None or len(df) == 0:
-        return None
-    if df.index.nlevels > 1:               # single-symbol requests return unnamed levels
-        df = df.xs(symbol, level=0)         # key by position, not name
-    return df[["open", "high", "low", "close", "volume"]]
+        universe = feed.select_universe(
+            dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) or config.UNIVERSE
+        return None, universe
 
 
 def current_positions(tc):
@@ -147,13 +141,13 @@ def run():
     except Exception as e:
         log.error("Auth failed (paper keys?): %s", e); sys.exit(1)
 
-    stats = load_stats()
+    stats, universe = load_stats_and_universe(dc)
     mode = "TRADE" if stats else "OBSERVE"
     start_equity = float(acct.equity)
     rm = RiskManager(start_equity)
 
-    log.info("=== live_paper starting | mode=%s | equity $%s ===",
-             mode, f"{start_equity:,.2f}")
+    log.info("=== live_paper starting | mode=%s | equity $%s | universe=%d ===",
+             mode, f"{start_equity:,.2f}", len(universe))
     if mode == "OBSERVE":
         log.info("No signal_stats.json -> OBSERVE mode: logging signals, NOT trading. "
                  "Run run_backtest.py to enable sizing.")
@@ -171,10 +165,14 @@ def run():
             equity = float(acct.equity)
             positions = current_positions(tc)
 
+            # ONE batched fetch for the whole universe + market proxy
+            frames = feed.fetch_bars_batch(dc, universe + [config.MARKET_PROXY],
+                                           FETCH_DAYS)
+
             # market-level volatility circuit-breaker (macro shocks)
             breaker = False
             try:
-                mkt = fetch_15m(dc, config.MARKET_PROXY)
+                mkt = frames.get(config.MARKET_PROXY)
                 if mkt is not None and len(mkt) > 20:
                     ret = mkt["close"].pct_change()
                     recent_move = abs(ret.iloc[-1])
@@ -190,9 +188,9 @@ def run():
             action, reason = (no.news_risk_action({}, True) if breaker
                               else (NORMAL, "clear"))
 
-            for sym in config.UNIVERSE:
+            for sym in universe:
                 try:
-                    df = fetch_15m(dc, sym)
+                    df = frames.get(sym)
                     if df is None or len(df) < 60:
                         continue
                     sig = ts.confluence_signal(df)
