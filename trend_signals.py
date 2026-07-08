@@ -23,11 +23,12 @@ bigger size; uncertain edge -> LCB shrinkage sizes it down.
 from __future__ import annotations
 import pandas as pd
 import indicators as ind
+import config
 
-# timeframe weights (higher TF = more weight = trend context)
-DEFAULT_WEIGHTS = {"15min": 0.20, "30min": 0.30, "60min": 0.50}
-ADX_THRESHOLD = 25.0      # below this, trend is "weak" -> score scaled down
-ENTRY_THRESHOLD = 0.30    # |combined score| must exceed this to take a side
+# timeframe weights (higher TF = more weight = trend context); base = first key
+DEFAULT_WEIGHTS = config.TIMEFRAME_WEIGHTS
+ADX_THRESHOLD = config.ADX_THRESHOLD    # below this, trend is "weak" -> scaled down
+ENTRY_THRESHOLD = config.ENTRY_THRESHOLD
 
 
 def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -80,7 +81,9 @@ def confluence_signal(base_df: pd.DataFrame,
                       entry_threshold: float = ENTRY_THRESHOLD,
                       adx_threshold: float = ADX_THRESHOLD) -> dict:
     """
-    Full multi-timeframe signal from a single base (15min) OHLC feed.
+    Full multi-timeframe signal from the base OHLC feed. The base timeframe is
+    the FIRST key in `weights`; the rest are resampled up from it. So swapping
+    the timeframe ladder in config (e.g. 5m/15m/30m) needs no code change.
 
     Returns:
         direction : +1 long / -1 short / 0 flat
@@ -89,9 +92,11 @@ def confluence_signal(base_df: pd.DataFrame,
         stops     : {'supertrend', 'psar'} from the ENTRY (base) timeframe
     """
     weights = weights or DEFAULT_WEIGHTS
-    frames = {"15min": base_df}
-    frames["30min"] = resample_ohlc(base_df, "30min")
-    frames["60min"] = resample_ohlc(base_df, "60min")
+    tfs = list(weights.keys())
+    base_tf = tfs[0]
+    frames = {base_tf: base_df}
+    for tf in tfs[1:]:
+        frames[tf] = resample_ohlc(base_df, tf)
 
     per_tf, combined, wsum = {}, 0.0, 0.0
     for tf, w in weights.items():
@@ -108,7 +113,7 @@ def confluence_signal(base_df: pd.DataFrame,
     else:
         direction = 0
 
-    entry = per_tf["15min"]
+    entry = per_tf[base_tf]
     return {
         "direction": direction,
         "score": float(combined),
