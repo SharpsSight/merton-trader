@@ -39,7 +39,7 @@ from risk_manager import RiskManager, NORMAL
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (MarketOrderRequest, StopOrderRequest,
-                                      GetOrdersRequest)
+                                      TrailingStopOrderRequest, GetOrdersRequest)
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -71,21 +71,20 @@ def cancel_symbol_orders(tc, symbol):
 
 
 def place_entry_with_stop(tc, rm, symbol, approved, price, sig):
-    """Submit the entry market order, then a protective stop on the opposite side."""
+    """Submit the entry market order, then a TRAILING stop on the opposite side.
+    The trailing stop follows favourable moves (locking gains) and triggers when
+    the trend reverses by TRAIL_PERCENT — i.e. sells when profit turns down."""
     side = OrderSide.BUY if approved > 0 else OrderSide.SELL
     tc.submit_order(MarketOrderRequest(symbol=symbol, qty=abs(approved),
                                        side=side, time_in_force=TimeInForce.DAY))
-    direction = 1 if approved > 0 else -1
-    stop_px = rm.compute_stop(price, direction, sig["stops"])
-    if stop_px:
-        stop_side = OrderSide.SELL if approved > 0 else OrderSide.BUY
-        try:
-            tc.submit_order(StopOrderRequest(
-                symbol=symbol, qty=abs(approved), side=stop_side,
-                time_in_force=TimeInForce.DAY, stop_price=round(float(stop_px), 2)))
-        except Exception as e:
-            log.warning("  %s stop placement failed: %s", symbol, e)
-    return side, stop_px
+    stop_side = OrderSide.SELL if approved > 0 else OrderSide.BUY
+    try:
+        tc.submit_order(TrailingStopOrderRequest(
+            symbol=symbol, qty=abs(approved), side=stop_side,
+            time_in_force=TimeInForce.DAY, trail_percent=config.TRAIL_PERCENT))
+    except Exception as e:
+        log.warning("  %s trailing-stop failed: %s", symbol, e)
+    return side
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -221,14 +220,19 @@ def run():
                     conf = fac.confirmation(df, sig["direction"])
                     bucket = _bucket(sig["score"])
                     bstats = (stats or {}).get(bucket, {"mu": 0, "sigma": 0, "n": 0})
+
+                    # per-symbol realized vol over the holding horizon -> risk scaling
+                    bar_ret = df["close"].pct_change().dropna()
+                    symbol_vol = float(bar_ret.tail(100).std() * (config.HOLD_BARS ** 0.5))
+
                     intent = merton.size_position(equity, price, sig["direction"],
-                                                  bstats, conf["multiplier"])
+                                                  bstats, symbol_vol, conf["multiplier"])
 
                     if mode == "OBSERVE" or intent["shares"] == 0:
-                        log.info("  [obs] %-5s dir=%+d score=%+.2f conf=%.2f bucket=%s "
-                                 "would_size=%d flags=%s",
+                        log.info("  [obs] %-5s dir=%+d score=%+.2f conf=%.2f vol=%.3f "
+                                 "bucket=%s would_size=%d",
                                  sym, sig["direction"], sig["score"], conf["multiplier"],
-                                 bucket, intent["shares"], conf["flags"])
+                                 symbol_vol, bucket, intent["shares"])
                         continue
 
                     approved, gate = rm.gate_entry(sym, intent["shares"], price,
@@ -237,11 +241,12 @@ def run():
                         log.info("  [gate] %-5s blocked: %s (news=%s)", sym, gate, reason)
                         continue
 
-                    side, stop_px = place_entry_with_stop(tc, rm, sym, approved, price, sig)
-                    log.info("  [ORDER] %-5s %s %d @ ~%.2f stop=%s score=%+.2f bucket=%s",
-                             sym, side.value, abs(approved),
-                             price, f"{stop_px:.2f}" if stop_px else "none",
-                             sig["score"], bucket)
+                    side = place_entry_with_stop(tc, rm, sym, approved, price, sig)
+                    # update running state so portfolio caps bind for later symbols
+                    positions[sym] = {"shares": approved, "price": price}
+                    log.info("  [ORDER] %-5s %s %d @ ~%.2f frac=%.3f vol=%.3f score=%+.2f",
+                             sym, side.value, abs(approved), price,
+                             intent["fraction"], symbol_vol, sig["score"])
                 except Exception as e:
                     log.warning("  %s error: %s", sym, e)
 
