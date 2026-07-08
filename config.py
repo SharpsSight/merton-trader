@@ -65,5 +65,11 @@ HIGH_IMPACT_KEYWORDS = [
     "acquisition", "merger", "earnings", "fda", "tariff", "sanction",
 ]
 
+# --- overnight handling ---------------------------------------------------
+FLATTEN_EOD = False           # True = close all positions before the close (no
+                              # overnight risk); False = hold through. Decide by
+                              # the both-ways backtest comparison in run_backtest.
+FLATTEN_BUFFER_MIN = 10       # minutes before the close to flatten when FLATTEN_EOD
+
 # --- paths ----------------------------------------------------------------
 SIGNAL_STATS_PATH = "signal_stats.json"   # produced by backtest, read by runner
