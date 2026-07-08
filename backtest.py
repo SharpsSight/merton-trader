@@ -60,6 +60,7 @@ def build_signal_frame(df15: pd.DataFrame,
 
     base = _score_series(df15)
     out = df15.join(base[["st"]])
+    out["base_score"] = base["score"].values     # base-TF score (for sensitive exit)
     combined = weights[base_tf] * base["score"].fillna(0)
     wsum = weights[base_tf]
 
@@ -78,59 +79,89 @@ def build_signal_frame(df15: pd.DataFrame,
 # --------------------------------------------------------------------------
 # Backtest
 # --------------------------------------------------------------------------
-def run_backtest(df15: pd.DataFrame,
-                 entry_threshold: float = config.ENTRY_THRESHOLD,
-                 flatten_eod: bool = False) -> dict:
-    sf = build_signal_frame(df15)
-    cost = (config.SLIPPAGE_BPS + config.SPREAD_BPS) / 1e4  # per side
+def _simulate(sf: pd.DataFrame, entry_threshold: float, flatten_eod: bool,
+              trail: float, sensitive_exit: bool) -> list:
+    """Run the trade loop on a prebuilt signal frame. Cheap (no indicators), so
+    many exit variants can be compared without recomputing signals.
 
-    trades = []
-    pos = 0            # +1/-1/0
-    entry_px = entry_score = 0.0
-    stop = None
+    trail          : trailing-stop distance as a fraction (e.g. 0.025 = 2.5%).
+                     Models the LIVE trailing stop: tracks the best price since
+                     entry and exits when price retraces `trail` from it.
+    sensitive_exit : True = exit as soon as the BASE (5m) timeframe flips against
+                     the position; False = exit on the blended-score flip/decay.
+    """
+    cost = (config.SLIPPAGE_BPS + config.SPREAD_BPS) / 1e4
     o = sf["open"].values
     h = sf["high"].values
     lo = sf["low"].values
     c = sf["close"].values
     score = sf["score"].values
-    st = sf["st"].values
-    dates = sf.index.normalize().values     # for day-boundary detection
+    base = sf["base_score"].values
+    dates = sf.index.normalize().values
+    times = sf.index.values
     n = len(sf)
 
+    trades = []
+    pos = 0
+    entry_px = entry_score = 0.0
+    hwm = 0.0            # best price since entry (high-water for long, low for short)
+
     for i in range(1, n - 1):
-        # end-of-day flatten: new day + open position -> close at prior day's last close
         if flatten_eod and pos != 0 and dates[i] != dates[i - 1]:
             exit_px = c[i - 1] * (1 - pos * cost)
             trades.append({"entry_score": entry_score, "direction": pos,
-                           "ret": pos * (exit_px - entry_px) / entry_px})
+                           "ret": pos * (exit_px - entry_px) / entry_px,
+                           "exit_time": times[i - 1]})
             pos = 0
-            stop = None
 
         if pos == 0:
             if abs(score[i]) >= entry_threshold:
                 pos = 1 if score[i] > 0 else -1
-                entry_px = o[i + 1] * (1 + pos * cost)     # fill next open, adverse
+                entry_px = o[i + 1] * (1 + pos * cost)
                 entry_score = score[i]
-                stop = st[i]                                # supertrend stop at entry
+                hwm = entry_px
         else:
+            # update trailing water-mark
+            hwm = max(hwm, h[i]) if pos == 1 else min(hwm, lo[i])
             exit_now, exit_px = False, None
-            # intrabar stop breach
-            if stop is not None and not np.isnan(stop):
-                if pos == 1 and lo[i] <= stop:
-                    exit_now, exit_px = True, stop * (1 - cost)
-                elif pos == -1 and h[i] >= stop:
-                    exit_now, exit_px = True, stop * (1 + cost)
-            # signal flip / decay -> exit next open
-            if not exit_now and (np.sign(score[i]) != pos or abs(score[i]) < entry_threshold):
-                exit_now, exit_px = True, o[i + 1] * (1 - pos * cost)
+
+            # trailing stop
+            if pos == 1:
+                lvl = hwm * (1 - trail)
+                if lo[i] <= lvl:
+                    exit_now, exit_px = True, lvl * (1 - cost)
+            else:
+                lvl = hwm * (1 + trail)
+                if h[i] >= lvl:
+                    exit_now, exit_px = True, lvl * (1 + cost)
+
+            # signal exit
+            if not exit_now:
+                if sensitive_exit:
+                    flip = base[i] != 0 and np.sign(base[i]) != pos
+                else:
+                    flip = np.sign(score[i]) != pos or abs(score[i]) < entry_threshold
+                if flip:
+                    exit_now, exit_px = True, o[i + 1] * (1 - pos * cost)
 
             if exit_now:
-                ret = pos * (exit_px - entry_px) / entry_px
                 trades.append({"entry_score": entry_score, "direction": pos,
-                               "ret": ret})
+                               "ret": pos * (exit_px - entry_px) / entry_px,
+                               "exit_time": times[i]})
                 pos = 0
-                stop = None
 
+    return trades
+
+
+def run_backtest(df15: pd.DataFrame,
+                 entry_threshold: float = config.ENTRY_THRESHOLD,
+                 flatten_eod: bool = False,
+                 trail_pct: float = None,
+                 sensitive_exit: bool = None) -> dict:
+    sf = build_signal_frame(df15)
+    trail = trail_pct if trail_pct is not None else config.TRAIL_PERCENT / 100.0
+    sens = sensitive_exit if sensitive_exit is not None else config.SENSITIVE_EXIT
+    trades = _simulate(sf, entry_threshold, flatten_eod, trail, sens)
     return {"trades": trades, "stats": _bucket_stats(trades),
             "metrics": _metrics(trades)}
 
