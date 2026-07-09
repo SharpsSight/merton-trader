@@ -130,10 +130,8 @@ MIN_BUCKET_N = 100            # and this many trades in the bucket
 # Do not promote a good week here into a live deployment.
 #
 # NEVER set this True against a funded account.
-PLUMBING_TEST = True
+PLUMBING_TEST = False
 PLUMBING_FRACTION = 0.10      # fraction of equity per position when enabled
-                              # 0.10 reproduces the Jul 8 blotter exactly:
-                              # every position that day was pinned at MAX_FRACTION.
 
 # --- daily operation ------------------------------------------------------
 MARKET_TZ = "America/New_York"
