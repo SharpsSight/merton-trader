@@ -90,7 +90,12 @@ def fetch_bars_batch(dc, symbols, days, timeframe=BAR_5M, end=None) -> dict:
     if df is None or len(df) == 0:
         return out
     cols = ["open", "high", "low", "close", "volume"]
-    intraday = timeframe not in (BAR_DAY,)
+    # NOTE: TimeFrame has no __eq__ and TimeFrame.Day builds a fresh object on
+    # every access, so `timeframe == BAR_DAY` and `timeframe in (BAR_DAY,)` are
+    # both False for any caller that does not pass this exact module constant.
+    # Getting this wrong silently RTH-filters daily bars (timestamped midnight
+    # ET) down to nothing, and select_universe returns []. Check the unit.
+    intraday = timeframe.unit in (TimeFrameUnit.Minute, TimeFrameUnit.Hour)
 
     if df.index.nlevels > 1:
         for sym in symbols:
