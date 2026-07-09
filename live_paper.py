@@ -366,6 +366,11 @@ def run():
                     config.PLUMBING_FRACTION * 100)
         log.warning("P&L from this mode carries NO information about edge. It exists to")
         log.warning("exercise the order path and populate %s.", config.LIVE_TRADES_PATH)
+        log.warning("The `tradeable` screen is ALSO bypassed: every symbol in the")
+        log.warning("universe can enter, not just the %d that cleared MIN_EDGE_RATIO.",
+                    len(tradeable))
+        log.warning("Risk caps still bind: PER_SYMBOL_CAP=%.0f%%, MAX_GROSS=%.0f%%.",
+                    config.PER_SYMBOL_CAP * 100, config.MAX_GROSS_EXPOSURE * 100)
         log.warning("If this account is funded, KILL THE PROCESS NOW.")
         log.warning("=" * 78)
     reconcile(tc, current_positions(tc), session_date)
@@ -497,7 +502,7 @@ def run():
                     # --- entries ---------------------------------------------
                     if sig["direction"] == 0:
                         continue
-                    if sym not in tradeable:
+                    if sym not in tradeable and not config.PLUMBING_TEST:
                         continue
                     if not fresh:
                         continue                        # no entries on stale data
