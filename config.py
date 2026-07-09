@@ -57,6 +57,20 @@ SENSITIVE_EXIT = False        # True = exit on fast (5m) flip; False = on blende
 STOP_ATR_MULT = 2.0          # fallback stop distance if no indicator stop
 STOP_METHOD = "supertrend"    # 'supertrend' | 'psar' | 'atr'
 
+# --- data feed ------------------------------------------------------------
+# Alpaca's bars endpoint returns 04:00-20:00 ET and has no session filter. The
+# live runner only trades while clock.is_open, so any backtest trade opened or
+# closed outside RTH is a sample from a system that cannot exist. RTH_ONLY makes
+# the backtest measure what the runner can actually execute.
+RTH_ONLY = True
+import datetime as _dt
+RTH_START = _dt.time(9, 30)     # first bar opens 09:30
+RTH_LAST_BAR = _dt.time(15, 55)  # last 5-min bar opens 15:55, covers 15:55-16:00
+
+# 'raw' (the API default that was silently in effect) leaves splits unadjusted:
+# a 2:1 split prints as a -50% bar and enters the return distribution as a trade.
+BAR_ADJUSTMENT = "all"          # raw | split | dividend | all
+
 # --- execution model (pessimistic) ---------------------------------------
 SLIPPAGE_BPS = 5.0            # per side, matches the diagnostics baseline
 SPREAD_BPS = 2.0             # assumed half-spread cost per side
