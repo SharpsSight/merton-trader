@@ -36,7 +36,18 @@ def merton_fraction(mu: float, bucket_sigma: float, n: int, symbol_vol: float,
             or not math.isfinite(mu) or not math.isfinite(symbol_vol)):
         return 0.0
 
-    mu_lcb = mu - z * (bucket_sigma / math.sqrt(n))   # edge uncertainty shrink
+    # --- credibility floor, BEFORE the LCB ---------------------------------
+    # The LCB alone is a poor gate here: f = fractional*mu_lcb/(gamma*vol^2),
+    # which for vol=0.013, gamma=3, fractional=0.25 is f = 493 * mu_lcb. The
+    # cap binds at mu_lcb = 2.03 bps, while SE(mu) on a real bucket runs 2.6-9.8
+    # bps. So mu_lcb crossing zero by one standard error takes you from flat to
+    # ~max leverage. Require the edge to be a real effect first.
+    se = bucket_sigma / math.sqrt(n)
+    t = mu / se if se > 0 else 0.0
+    if n < config.MIN_BUCKET_N or t < config.MIN_BUCKET_T:
+        return 0.0
+
+    mu_lcb = mu - z * se                              # edge uncertainty shrink
     if mu_lcb <= 0:
         return 0.0                                     # edge not credible -> flat
 
@@ -79,11 +90,13 @@ def size_position(equity: float, price: float, direction: int,
     if shares == 0:
         return _empty(direction)
 
-    mu_lcb = mu - config.LCB_Z * (bucket_sigma / math.sqrt(n)) if n >= 2 and bucket_sigma > 0 else 0.0
+    se = bucket_sigma / math.sqrt(n) if n >= 2 and bucket_sigma > 0 else 0.0
+    mu_lcb = mu - config.LCB_Z * se if se > 0 else 0.0
     return {"shares": shares, "fraction": frac, "notional": abs(shares) * price,
-            "mu_lcb": mu_lcb, "direction": direction}
+            "mu_lcb": mu_lcb, "bucket_t": (mu / se) if se > 0 else 0.0,
+            "direction": direction}
 
 
 def _empty(direction: int) -> dict:
     return {"shares": 0, "fraction": 0.0, "notional": 0.0,
-            "mu_lcb": 0.0, "direction": direction}
+            "mu_lcb": 0.0, "bucket_t": 0.0, "direction": direction}
