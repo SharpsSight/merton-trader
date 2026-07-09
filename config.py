@@ -159,7 +159,35 @@ CLOSE_RETRY_SLEEP_SEC = 2.0
 # trade log (which the Welch/Levene/KS diagnostics consume) is destroyed every
 # time you push.
 import os
-DATA_DIR = os.environ.get("DATA_DIR", ".")
+import sys as _sys
+
+_requested = os.environ.get("DATA_DIR", ".")
+
+
+def _resolve_data_dir(path: str) -> str:
+    """Create DATA_DIR, or fall back to cwd rather than crashing the process.
+
+    Setting DATA_DIR=/data does not create /data. If the Railway volume is not
+    mounted (or is mounted at a different path), open() raises FileNotFoundError
+    on the first write, the container dies, Railway restarts it, and the whole
+    backtest re-runs -- forever. A missing volume should degrade, not crash.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_probe")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return path
+    except OSError as e:
+        print(f"WARNING: DATA_DIR={path!r} is not writable ({e}). "
+              f"Falling back to '.'. Persistent files WILL be lost on redeploy: "
+              f"check that the Railway volume is mounted at {path!r}.",
+              file=_sys.stderr, flush=True)
+        return "."
+
+
+DATA_DIR = _resolve_data_dir(_requested)
 SIGNAL_STATS_PATH = os.path.join(DATA_DIR, "signal_stats.json")  # backtest -> runner
 BACKTEST_TRADES_PATH = os.path.join(DATA_DIR, "backtest_trades.csv")
 LIVE_TRADES_PATH = os.path.join(DATA_DIR, "live_trades.csv")
