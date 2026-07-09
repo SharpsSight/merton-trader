@@ -104,6 +104,7 @@ def _simulate(sf: pd.DataFrame, entry_threshold: float, flatten_eod: bool,
     trades = []
     pos = 0
     entry_px = entry_score = 0.0
+    entry_i = 0
     hwm = 0.0            # best price since entry (high-water for long, low for short)
 
     for i in range(1, n - 1):
@@ -111,7 +112,8 @@ def _simulate(sf: pd.DataFrame, entry_threshold: float, flatten_eod: bool,
             exit_px = c[i - 1] * (1 - pos * cost)
             trades.append({"entry_score": entry_score, "direction": pos,
                            "ret": pos * (exit_px - entry_px) / entry_px,
-                           "exit_time": times[i - 1]})
+                           "entry_time": times[entry_i], "exit_time": times[i - 1],
+                           "bars_held": i - 1 - entry_i, "exit_kind": "eod"})
             pos = 0
 
         if pos == 0:
@@ -119,21 +121,37 @@ def _simulate(sf: pd.DataFrame, entry_threshold: float, flatten_eod: bool,
                 pos = 1 if score[i] > 0 else -1
                 entry_px = o[i + 1] * (1 + pos * cost)
                 entry_score = score[i]
+                entry_i = i
                 hwm = entry_px
         else:
-            # update trailing water-mark
-            hwm = max(hwm, h[i]) if pos == 1 else min(hwm, lo[i])
             exit_now, exit_px = False, None
 
-            # trailing stop
+            # --- trailing stop -------------------------------------------------
+            # The stop level for bar i is derived from the high-water mark as of
+            # the CLOSE OF BAR i-1. Using h[i] to raise the HWM before testing
+            # lo[i] against it is intrabar look-ahead: you cannot know a bar's
+            # high before its low. The old ordering ratcheted the stop up before
+            # measuring the drawdown against it -- a free win on every bar.
+            #
+            # Fills use min(open, level) for longs / max(open, level) for shorts:
+            # a bar that GAPS THROUGH the stop fills at the open, not at the
+            # level. With FLATTEN_EOD=False every overnight gap hits this path,
+            # and the old code silently assumed a fill at the untouched level.
+            kind = None
             if pos == 1:
                 lvl = hwm * (1 - trail)
                 if lo[i] <= lvl:
-                    exit_now, exit_px = True, lvl * (1 - cost)
+                    fill = min(o[i], lvl)
+                    exit_now, exit_px, kind = True, fill * (1 - cost), "stop"
             else:
                 lvl = hwm * (1 + trail)
                 if h[i] >= lvl:
-                    exit_now, exit_px = True, lvl * (1 + cost)
+                    fill = max(o[i], lvl)
+                    exit_now, exit_px, kind = True, fill * (1 + cost), "stop"
+
+            # update the water-mark only AFTER the stop test for this bar
+            if not exit_now:
+                hwm = max(hwm, h[i]) if pos == 1 else min(hwm, lo[i])
 
             # signal exit
             if not exit_now:
@@ -142,12 +160,13 @@ def _simulate(sf: pd.DataFrame, entry_threshold: float, flatten_eod: bool,
                 else:
                     flip = np.sign(score[i]) != pos or abs(score[i]) < entry_threshold
                 if flip:
-                    exit_now, exit_px = True, o[i + 1] * (1 - pos * cost)
+                    exit_now, exit_px, kind = True, o[i + 1] * (1 - pos * cost), "signal"
 
             if exit_now:
                 trades.append({"entry_score": entry_score, "direction": pos,
                                "ret": pos * (exit_px - entry_px) / entry_px,
-                               "exit_time": times[i]})
+                               "entry_time": times[entry_i], "exit_time": times[i],
+                               "bars_held": i - entry_i, "exit_kind": kind})
                 pos = 0
 
     return trades
