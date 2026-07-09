@@ -72,5 +72,67 @@ FLATTEN_EOD = False           # True = close all positions before the close (no
                               # the both-ways backtest comparison in run_backtest.
 FLATTEN_BUFFER_MIN = 10       # minutes before the close to flatten when FLATTEN_EOD
 
+# --- selection-bias control ----------------------------------------------
+# MIN_EDGE_RATIO is a THRESHOLD ON THE MAXIMUM OF 50 CORRELATED TEST STATISTICS.
+# Algebraically ratio = (t - LCB_Z)/sqrt(n), so ratio >= 0.05 is t >= 1 + 0.05*sqrt(n)
+# -- about t >= 1.41 at n=68. The expected max t of ~10-20 effectively independent
+# noise draws is 1.36-1.71. A symbol can therefore "clear the bar" while being
+# indistinguishable from the best of 50 coin flips.
+#
+# run_backtest.py --bootstrap now estimates the null distribution of
+# max(edge_ratio) by sign-flipping trades within each symbol. Set this from that
+# output (the empirical 95th percentile), not by intuition.
+BOOTSTRAP_ITERS = 2000        # 0 disables; ~30s for 2000 on a 4k-trade sample
+SELECTION_ALPHA = 0.05        # one-sided FWER target for the max-statistic null
+
+# --- bucket credibility floor --------------------------------------------
+# Merton's f = FRACTIONAL * mu_lcb / (GAMMA * symbol_vol^2). With symbol_vol ~ 0.013
+# that is f = 493 * mu_lcb, so MAX_FRACTION binds at mu_lcb = 2.03 BASIS POINTS
+# while the standard error on bucket mu is 2.6-9.8 bps. The sizer's entire
+# dynamic range is smaller than its own estimation noise: it is a step function
+# between 0 and MAX_FRACTION, and GAMMA/FRACTIONAL do nothing.
+#
+# MIN_BUCKET_T requires the bucket's edge to be statistically real before any
+# size is taken, independent of how the LCB happens to land.
+MIN_BUCKET_T = 2.0            # require mu / SE(mu) >= this before sizing at all
+MIN_BUCKET_N = 100            # and this many trades in the bucket
+
+# --- PLUMBING TEST (paper only) -------------------------------------------
+# Bypasses Merton and sizes every signal at a small FIXED fraction of equity.
+#
+# WHAT THIS IS FOR: exercising the full order path -- entry, trailing stop,
+# exit, flip, reconcile, trade log -- so the live/backtest distribution
+# comparison has an input, and so plumbing bugs surface before real capital.
+#
+# WHAT THIS IS NOT: evidence of edge. Sizing here is arbitrary and has no
+# relationship to mu, sigma, or n. Resulting P&L carries ZERO information about
+# whether the strategy works. At zero transaction cost no bucket in the current
+# backtest reaches t = 2.0; b30_50 (70% of the sample) has t = 0.00 gross.
+# Do not promote a good week here into a live deployment.
+#
+# NEVER set this True against a funded account.
+PLUMBING_TEST = True
+PLUMBING_FRACTION = 0.10      # fraction of equity per position when enabled
+                              # 0.10 reproduces the Jul 8 blotter exactly:
+                              # every position that day was pinned at MAX_FRACTION.
+
+# --- daily operation ------------------------------------------------------
+MARKET_TZ = "America/New_York"
+BACKTEST_DAYS = 60            # --days passed to the nightly stats refresh
+STATS_REFRESH_START_ET = "08:00"   # nightly refresh window (pre-open)
+STATS_REFRESH_END_ET = "09:20"
+MAX_BAR_STALENESS_SEC = 900   # during RTH, no fresh bar in this long -> no entries
+BREAKER_COOLDOWN_CYCLES = 5   # volatility breaker stays hot this many cycles
+CLOSE_RETRY_ATTEMPTS = 5      # poll cycles waiting for cancelled orders to release qty
+CLOSE_RETRY_SLEEP_SEC = 2.0
+
 # --- paths ----------------------------------------------------------------
-SIGNAL_STATS_PATH = "signal_stats.json"   # produced by backtest, read by runner
+# NOTE: Railway containers have an EPHEMERAL filesystem. Anything written here is
+# lost on redeploy. Mount a volume and point DATA_DIR at it, otherwise the live
+# trade log (which the Welch/Levene/KS diagnostics consume) is destroyed every
+# time you push.
+import os
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+SIGNAL_STATS_PATH = os.path.join(DATA_DIR, "signal_stats.json")  # backtest -> runner
+BACKTEST_TRADES_PATH = os.path.join(DATA_DIR, "backtest_trades.csv")
+LIVE_TRADES_PATH = os.path.join(DATA_DIR, "live_trades.csv")
