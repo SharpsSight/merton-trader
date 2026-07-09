@@ -69,6 +69,8 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout,
 log = logging.getLogger("runner")
 
 ET = ZoneInfo(config.MARKET_TZ)
+BASE_BAR_MIN = int(list(config.TIMEFRAME_WEIGHTS)[0].replace("min", ""))
+MAX_HOLD_SEC = config.MAX_HOLD_BARS * BASE_BAR_MIN * 60 if config.MAX_HOLD_BARS else 0
 OPEN_POLL_SECONDS = 60
 CLOSED_POLL_CAP = 900
 FETCH_DAYS = 15               # trailing history per symbol for warmup
@@ -367,6 +369,11 @@ def run():
     equity = float(acct.equity)
     rm = RiskManager(equity, session_date=session_date)
     breaker_cooldown = 0
+    # in-memory only. With FLATTEN_EOD the book never survives a session, so a
+    # process restart cannot orphan an entry time for long. Inherited positions
+    # get their clock started at first sighting, which is conservative: it can
+    # only delay a max-hold exit, never trigger one early.
+    entry_times = {}
 
     log.info("=== live_paper starting | mode=%s | equity $%s | universe=%d "
              "| tradeable=%d | session=%s | stats_generated=%s ===",
@@ -404,6 +411,7 @@ def run():
                 equity = float(acct.equity)
                 rm.new_session(equity, session_date)    # start_equity + halt latch
                 breaker_cooldown = 0
+                entry_times.clear()
                 reconcile(tc, current_positions(tc), session_date)
 
             # ---------- market closed --------------------------------------
@@ -435,6 +443,7 @@ def run():
                 if 0 < secs_to_close <= config.FLATTEN_BUFFER_MIN * 60:
                     for s in list(positions.keys()):
                         close_position_safely(tc, s)
+                    entry_times.clear()
                     log.info("EOD FLATTEN | closed %d positions | %.0f min to close",
                              len(positions), secs_to_close / 60)
                     time.sleep(OPEN_POLL_SECONDS); continue
@@ -503,11 +512,32 @@ def run():
                                   shares=-held, price=price, score=sig["score"],
                                   bucket=_bucket(sig["score"]), gate="exit")
                         positions.pop(sym, None)
+                        entry_times.pop(sym, None)
                         if plan == "EXIT":
                             continue
                         held_dir = 0                    # FLIP falls through to enter
 
                     if plan == "HOLD":
+                        # hard holding-time cap: exit regardless of signal
+                        if MAX_HOLD_SEC and held != 0:
+                            t0 = entry_times.get(sym)
+                            if t0 is None:
+                                entry_times[sym] = now      # inherited; start clock
+                            elif (now - t0).total_seconds() >= MAX_HOLD_SEC:
+                                if close_position_safely(tc, sym):
+                                    log.info("  [MAXHOLD] %-5s closed after %.0f min "
+                                             "(cap %d bars) score=%+.2f", sym,
+                                             (now - t0).total_seconds() / 60,
+                                             config.MAX_HOLD_BARS, sig["score"])
+                                    log_trade(ts_utc=now.isoformat(),
+                                              session_date=str(session_date), symbol=sym,
+                                              action="MAXHOLD", direction=held_dir,
+                                              shares=-held, price=price,
+                                              score=sig["score"],
+                                              bucket=_bucket(sig["score"]), gate="max_hold")
+                                    positions.pop(sym, None)
+                                    entry_times.pop(sym, None)
+                                continue
                         if held != 0 and sym not in protected:
                             place_trailing_stop(tc, sym, abs(held), held > 0)
                             log.info("  [PROTECT] %-5s re-armed trailing stop (held %+d)",
@@ -557,6 +587,7 @@ def run():
 
                     side = place_entry_with_stop(tc, rm, sym, approved, price, sig)
                     positions[sym] = {"shares": approved, "price": price}
+                    entry_times[sym] = now
                     log.info("  [ORDER] %-5s %s %d @ ~%.2f frac=%.3f vol=%.3f "
                              "score=%+.2f t=%+.2f",
                              sym, side.value, abs(approved), price,
