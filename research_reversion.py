@@ -139,7 +139,7 @@ def report(packed, n_dates, iters, cost_per_side, label=""):
         print(f"  ... {len(rows)-8} more cells")
 
     obs = rows[0][4]
-    null = bootstrap_max_t(packed, n_dates, iters)
+    null = bootstrap_max_t(packed, n_dates, iters, cost_rt=2 * cost_per_side)
     q95 = float(np.quantile(null, 1 - config.SELECTION_ALPHA))
     p = float((null >= obs).mean())
 
@@ -168,7 +168,7 @@ def cost_sweep(frames, iters):
             continue
         obs = max(tstat(v["rets"]) for v in packed.values())
         best = max(packed, key=lambda k: tstat(packed[k]["rets"]))
-        null = bootstrap_max_t(packed, nd, iters, seed=5)
+        null = bootstrap_max_t(packed, nd, iters, cost_rt=2 * bps / 1e4, seed=5)
         q95 = float(np.quantile(null, 0.95))
         p = float((null >= obs).mean())
         flag = " <- edge only exists below real spreads" if (p < 0.05 and bps <= 1.0) else ""
