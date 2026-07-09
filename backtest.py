@@ -153,6 +153,11 @@ def _simulate(sf: pd.DataFrame, entry_threshold: float, flatten_eod: bool,
             if not exit_now:
                 hwm = max(hwm, h[i]) if pos == 1 else min(hwm, lo[i])
 
+            # max holding time -> exit at next open, regardless of signal
+            if not exit_now and config.MAX_HOLD_BARS and \
+                    (i - entry_i) >= config.MAX_HOLD_BARS:
+                exit_now, exit_px, kind = True, o[i + 1] * (1 - pos * cost), "max_hold"
+
             # signal exit
             if not exit_now:
                 if sensitive_exit:
