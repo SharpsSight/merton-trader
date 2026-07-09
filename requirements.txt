@@ -3,4 +3,5 @@ alpaca-py>=0.42        # broker + market data + news SDK
 python-dotenv>=1.0     # load API keys from local .env
 pandas>=2.2            # bars, indicators, backtest
 numpy>=1.26            # numerics
-# scipy added later, only when the weekly diagnostics module (Welch/Levene/KS) lands
+tzdata>=2024.1         # zoneinfo needs this on slim/alpine containers
+scipy>=1.11            # Welch / Levene / KS in the weekly diagnostics
