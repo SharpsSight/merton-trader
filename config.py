@@ -43,9 +43,14 @@ MAX_GROSS_EXPOSURE = 1.0      # sum |position value| <= this * equity (no levera
 MAX_POSITIONS = None          # no count cap: worthiness + gross exposure decide breadth
 PER_SYMBOL_CAP = 0.10         # max fraction of equity per symbol
 MIN_SYMBOL_TRADES = 30        # min backtest trades to judge a symbol's own edge
-MIN_EDGE_RATIO = 0.05         # worthiness bar: mu_lcb / sigma (return per unit risk).
-                              # Higher = stricter. A symbol is traded only if its
-                              # risk-adjusted edge clears this, not just mu_lcb > 0.
+MIN_EDGE_RATIO = 0.2551       # worthiness bar: mu_lcb / sigma (return per unit risk).
+                              # MEASURED, not guessed: this is the 95th percentile of
+                              # max(edge_ratio) under the date-blocked sign-flip null,
+                              # 2000 resamples, 50 symbols, run 2026-07-09.
+                              # The old value of 0.05 was 5x too lenient -- it admitted
+                              # TSLA at ratio=0.0721, which is BELOW the null median of
+                              # 0.1444 (family-wise p = 0.908).
+                              # Re-measure with: run_backtest.py --bootstrap 2000
 DAILY_LOSS_HALT = 0.03        # halt new entries if day PnL <= -3% of start equity
 TRAIL_PERCENT = 2.5          # trailing-stop distance (%) — locks gains, cuts losers
 SENSITIVE_EXIT = False        # True = exit on fast (5m) flip; False = on blended flip
