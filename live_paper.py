@@ -233,7 +233,22 @@ def load_stats_and_universe(dc):
         stats = payload.get("buckets", {})
         universe = payload.get("universe") or feed.select_universe(
             dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) or config.UNIVERSE
-        tradeable = set(payload.get("tradeable") or universe)
+
+        # `[] or universe` -> universe. An EMPTY tradeable list means "no symbol
+        # cleared MIN_EDGE_RATIO", and the old `or` read that as "field missing,
+        # trade everything". The screen inverted exactly when it should have been
+        # most restrictive. Distinguish absent (None) from empty ([]).
+        t = payload.get("tradeable")
+        if t is None:
+            tradeable = set(universe)
+            log.warning("signal_stats.json has no `tradeable` key -- treating all "
+                        "%d universe symbols as eligible", len(universe))
+        else:
+            tradeable = set(t)
+            if not tradeable:
+                log.warning("tradeable is EMPTY: no symbol cleared MIN_EDGE_RATIO=%s. "
+                            "No entries will be taken. Held positions still exit.",
+                            config.MIN_EDGE_RATIO)
         return stats, universe, tradeable, payload.get("generated_at")
     except FileNotFoundError:
         universe = feed.select_universe(
