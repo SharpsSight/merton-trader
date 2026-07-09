@@ -86,10 +86,20 @@ HIGH_IMPACT_KEYWORDS = [
 ]
 
 # --- overnight handling ---------------------------------------------------
-FLATTEN_EOD = False           # True = close all positions before the close (no
-                              # overnight risk); False = hold through. Decide by
-                              # the both-ways backtest comparison in run_backtest.
+FLATTEN_EOD = True            # True = close all positions before the close.
+                              # Every dollar the system has ever made came from
+                              # overnight gaps (Jul 8: 3 longs, +$958). Every
+                              # same-day round trip it opened AND closed lost
+                              # money (0 for 6, -$137). Turning this on removes
+                              # the gap exposure -- which means it also removes
+                              # the only source of P&L the system has shown.
+                              # That is the point: it isolates the signal.
 FLATTEN_BUFFER_MIN = 10       # minutes before the close to flatten when FLATTEN_EOD
+
+# Maximum bars to hold a position before exiting at the next open, regardless of
+# signal. 24 five-minute bars = 2 hours. Caps the tail of the holding-time
+# distribution so mu/sigma are estimated over a horizon the runner can honour.
+MAX_HOLD_BARS = 24
 
 # --- selection-bias control ----------------------------------------------
 # MIN_EDGE_RATIO is a THRESHOLD ON THE MAXIMUM OF 50 CORRELATED TEST STATISTICS.
