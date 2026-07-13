@@ -140,7 +140,9 @@ MIN_BUCKET_N = 100            # and this many trades in the bucket
 # Do not promote a good week here into a live deployment.
 #
 # NEVER set this True against a funded account.
-PLUMBING_TEST = False
+PLUMBING_TEST = True         # PAPER ONLY. Fixed-fraction sizing, Merton bypassed.
+                             # Trades while edge research runs. Zero edge info.
+                             # NEVER True against a funded account.
 PLUMBING_FRACTION = 0.10      # fraction of equity per position when enabled
 
 # --- daily operation ------------------------------------------------------
