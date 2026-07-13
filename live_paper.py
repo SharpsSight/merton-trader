@@ -39,7 +39,14 @@ import json
 import time
 import logging
 import subprocess
-import requests  # PATCH: for pushing status/trades to Supabase
+try:
+    import requests  # PATCH: for pushing status/trades to Supabase
+except ImportError:
+    # Dashboard mirroring is a nice-to-have. If `requests` isn't installed
+    # (e.g. it was never added to requirements.txt when the Supabase patch
+    # landed), the trader must NOT crash-loop over it -- push_* degrade to
+    # no-ops below when `requests is None`.
+    requests = None
 from datetime import datetime, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -70,7 +77,25 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout,
 log = logging.getLogger("runner")
 
 ET = ZoneInfo(config.MARKET_TZ)
-BASE_BAR_MIN = int(list(config.TIMEFRAME_WEIGHTS)[0].replace("min", ""))
+
+
+def _tf_minutes(tf) -> int:
+    """Parse a timeframe key to integer minutes, tolerant of format.
+
+    The old one-liner did ``int(key.replace("min",""))`` which assumes the
+    exact string "5min". If config uses "5m", "15m", "30m" (or an int, or
+    "5 min"), that raised ValueError at MODULE IMPORT and crash-looped the
+    whole process before run() ever executed. Strip to digits instead.
+    """
+    if isinstance(tf, (int, float)):
+        return int(tf)
+    digits = "".join(ch for ch in str(tf) if ch.isdigit())
+    if not digits:
+        raise ValueError(f"cannot parse timeframe minutes from {tf!r}")
+    return int(digits)
+
+
+BASE_BAR_MIN = _tf_minutes(list(config.TIMEFRAME_WEIGHTS)[0])
 MAX_HOLD_SEC = config.MAX_HOLD_BARS * BASE_BAR_MIN * 60 if config.MAX_HOLD_BARS else 0
 OPEN_POLL_SECONDS = 60
 CLOSED_POLL_CAP = 900
@@ -96,7 +121,7 @@ def _supabase_headers():
 
 def push_status(**row):
     """Upsert the single live-status row so the dashboard can read current state."""
-    if not SUPABASE_KEY:
+    if not SUPABASE_KEY or requests is None:
         return
     try:
         requests.post(
@@ -111,7 +136,7 @@ def push_status(**row):
 
 def push_trade(**row):
     """Insert one trade/order event, same schema as log_trade's CSV."""
-    if not SUPABASE_KEY:
+    if not SUPABASE_KEY or requests is None:
         return
     try:
         requests.post(
@@ -637,7 +662,12 @@ def run():
                                           fraction=config.PLUMBING_FRACTION,
                                           notional=sh * price)
 
-                    if mode == "OBSERVE" or intent["shares"] == 0:
+                    # PLUMBING_TEST must beat the OBSERVE gate, not only the
+                    # sizer. Previously OBSERVE short-circuited every entry here
+                    # even with PLUMBING_TEST=True, so a cold container (no
+                    # signal_stats.json) ran "alive" but placed zero orders.
+                    if (mode == "OBSERVE" and not config.PLUMBING_TEST) \
+                            or intent["shares"] == 0:
                         log.info("  [obs] %-5s dir=%+d score=%+.2f conf=%.2f vol=%.3f "
                                  "bucket=%s t=%+.2f mu_lcb=%+.5f would_size=%d",
                                  sym, sig["direction"], sig["score"], conf["multiplier"],
