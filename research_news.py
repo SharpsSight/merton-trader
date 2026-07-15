@@ -322,13 +322,18 @@ def main():
 
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.historical.news import NewsClient
+    from alpaca.trading.client import TradingClient
     import data_feed as feed
 
     dc = StockHistoricalDataClient(api_key, secret)
     nc = NewsClient(api_key, secret)
+    tc = TradingClient(api_key, secret, paper=True)  # asset list for dynamic universe
 
-    universe = feed.select_universe(dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) \
-        or config.UNIVERSE
+    if config.USE_DYNAMIC_UNIVERSE:
+        universe = feed.dynamic_universe(dc, tc, config.UNIVERSE_SIZE) or config.UNIVERSE
+    else:
+        universe = feed.select_universe(dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) \
+            or config.UNIVERSE
     print(f"Universe ({len(universe)}): {', '.join(universe)}\n")
 
     end = datetime.now(timezone.utc)
