@@ -140,10 +140,41 @@ MIN_BUCKET_N = 100            # and this many trades in the bucket
 # Do not promote a good week here into a live deployment.
 #
 # NEVER set this True against a funded account.
-PLUMBING_TEST = True         # PAPER ONLY. Fixed-fraction sizing, Merton bypassed.
-                             # Trades while edge research runs. Zero edge info.
-                             # NEVER True against a funded account.
+PLUMBING_TEST = False        # CUTOVER: real concurrent-Merton + vol-targeting is
+                             # now live (see ALLOCATOR block below). Fixed-fraction
+                             # plumbing is OFF. With gates intact this trades 0 until
+                             # a bucket clears MIN_BUCKET_T -- that is correct, not a
+                             # hang. Set True again only to exercise the order path.
 PLUMBING_FRACTION = 0.10      # fraction of equity per position when enabled
+
+# --- CONCURRENT ALLOCATOR + CONSTANT-VOLATILITY TARGETING -----------------
+# The live runner sizes the whole candidate book JOINTLY each bar (merton_alloc)
+# and then scales gross exposure to hold portfolio vol at VOL_TARGET_ANNUAL.
+#
+# READ THIS: vol targeting is a RISK controller, not a return generator. It holds
+# volatility constant; it does not change the SIGN of returns. On a signal with
+# mu<=0 it produces a constant-vol path with negative drift -- smoother losing,
+# not winning. It converts risk into RETURN only when the buckets feeding it have
+# a real (t>=MIN_BUCKET_T) positive edge. None currently do. So today this block
+# sizes every name to ZERO, exactly like the bare Merton sizer. It goes aggressive
+# automatically the moment slice_edge/reversion produce a qualifying bucket.
+VOL_TARGET_ANNUAL = 0.15     # AGGRESSION DIAL. Annualized portfolio vol target.
+                             # ~0.10 conservative | ~0.15 S&P-like | 0.25+ aggressive.
+                             # Higher = lever up harder in calm tapes (up to the cap).
+BOOK_CORRELATION = 0.40      # avg pairwise correlation assumed in the book-vol model
+                             # (large-cap intraday co-movement). Raise -> vol-target
+                             # treats the book as less diversified -> smaller gross.
+CONCENTRATION = 1.0          # 1.0 = pure proportional Merton allocation.
+                             # >1.0 tilts harder into the strongest-edge names
+                             # (explicit, non-theoretical override; leave at 1.0
+                             # unless you deliberately want winner-take-more).
+#
+# LEVERAGE: the vol-target's gross ceiling IS MAX_GROSS_EXPOSURE (above). It is
+# 1.0 = no leverage. To let the vol-targeter lever up, raise MAX_GROSS_EXPOSURE
+# ABOVE 1.0 (e.g. 2.0). That is the ONLY knob that lets this trade bigger than
+# unlevered -- and on zero-edge signal it amplifies variance, not return. Set it
+# with that understood; the RiskManager gross gate reads the same value, so they
+# stay consistent.
 
 # --- daily operation ------------------------------------------------------
 MARKET_TZ = "America/New_York"
