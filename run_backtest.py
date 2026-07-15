@@ -85,15 +85,23 @@ def bootstrap_max_ratio(trades_by_symbol: dict, iters: int, seed: int = 0):
     Sign-flips returns by EXIT DATE, one draw per date shared across symbols, so
     that market-wide co-movement (which is what makes 50 large-caps far fewer
     than 50 independent tests) survives into the null.
+
+    FIX (net->gross): t['ret'] is NET of costs. Sign-flipping NET flips the fixed
+    per-trade cost along with the signal, which biases the null upward and sets
+    MIN_EDGE_RATIO too high (over-conservative screen). The correct null flips the
+    GROSS return and subtracts the cost afterward -- identical to slice_edge.py.
+    Under flip=+1 this reproduces the observed net sample exactly, as it must.
     """
     rng = np.random.default_rng(seed)
     dates = sorted({d for v in trades_by_symbol.values() for d in v["dates"]})
     date_ix = {d: i for i, d in enumerate(dates)}
+    cost_rt = 2 * (config.SLIPPAGE_BPS + config.SPREAD_BPS) / 1e4   # round-trip cost
 
     packed = []
     for sym, v in trades_by_symbol.items():
         if len(v["rets"]) >= config.MIN_SYMBOL_TRADES:
-            packed.append((np.asarray(v["rets"]),
+            gross = np.asarray(v["rets"], dtype=float) + cost_rt   # reconstruct GROSS
+            packed.append((gross,
                            np.asarray([date_ix[d] for d in v["dates"]])))
     if not packed:
         return np.array([])
@@ -102,8 +110,8 @@ def bootstrap_max_ratio(trades_by_symbol: dict, iters: int, seed: int = 0):
     for b in range(iters):
         flips = rng.choice([-1.0, 1.0], size=len(dates))
         best = -np.inf
-        for rets, ix in packed:
-            best = max(best, edge_ratio(rets * flips[ix]))
+        for gross, ix in packed:
+            best = max(best, edge_ratio(gross * flips[ix] - cost_rt))  # flip gross, pay cost
         out[b] = best
     return out
 
