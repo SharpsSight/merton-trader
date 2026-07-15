@@ -39,14 +39,12 @@ import json
 import time
 import logging
 import subprocess
-try:
-    import requests  # PATCH: for pushing status/trades to Supabase
-except ImportError:
-    # Dashboard mirroring is a nice-to-have. If `requests` isn't installed
-    # (e.g. it was never added to requirements.txt when the Supabase patch
-    # landed), the trader must NOT crash-loop over it -- push_* degrade to
-    # no-ops below when `requests is None`.
-    requests = None
+# stdlib HTTP for Supabase mirroring. Using urllib (not `requests`) means the
+# import can NEVER fail -- the old `try: import requests / except: requests=None`
+# guard silently no-op'd the ENTIRE dashboard mirror whenever requests wasn't in
+# requirements.txt, which is the most likely reason the tables were empty.
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -110,44 +108,60 @@ FETCH_DAYS = 15  # trailing history per symbol for warmup
 # ---------------------------------------------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://nrcwewfcvpbzribeahzn.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+_SUPABASE_WARNED = False
 
 
-def _supabase_headers():
-    return {
+def _supabase_ready():
+    """Log ONCE, loudly, if mirroring is off -- so a dead dashboard shows up in
+    the logs instead of silently writing zero rows forever (the old bug)."""
+    global _SUPABASE_WARNED
+    if SUPABASE_KEY:
+        return True
+    if not _SUPABASE_WARNED:
+        log.warning("SUPABASE MIRROR OFF: SUPABASE_SERVICE_KEY is not set. "
+                    "Dashboard tables (merton_status/merton_trades) will stay "
+                    "EMPTY. Set the service_role key in Railway env vars.")
+        _SUPABASE_WARNED = True
+    return False
+
+
+def _supabase_post(table, payload, upsert=False):
+    """POST one row via stdlib urllib. CHECKS the HTTP status and logs non-2xx --
+    a 401 (bad key), 404 (wrong table) or 400 (schema mismatch) is exactly how
+    rows silently never appear even when the key IS set and the import works.
+    Never raises: dashboard mirroring must not crash the trader."""
+    if not _supabase_ready():
+        return
+    headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
     }
+    if upsert:
+        headers["Prefer"] = "resolution=merge-duplicates"
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/{table}",
+        data=json.dumps(payload, default=str).encode(),
+        headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if not (200 <= resp.status < 300):
+                log.warning("supabase %s -> HTTP %s", table, resp.status)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")[:200]
+        log.warning("supabase %s -> HTTP %s: %s", table, e.code, body)
+    except Exception as e:
+        log.warning("supabase %s push failed: %s", table, e)
 
 
 def push_status(**row):
     """Upsert the single live-status row so the dashboard can read current state."""
-    if not SUPABASE_KEY or requests is None:
-        return
-    try:
-        requests.post(
-            f"{SUPABASE_URL}/rest/v1/merton_status",
-            headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates"},
-            json={"id": "live", **row},
-            timeout=5,
-        )
-    except Exception as e:
-        log.warning("supabase status push failed: %s", e)
+    _supabase_post("merton_status", {"id": "live", **row}, upsert=True)
 
 
 def push_trade(**row):
     """Insert one trade/order event, same schema as log_trade's CSV."""
-    if not SUPABASE_KEY or requests is None:
-        return
-    try:
-        requests.post(
-            f"{SUPABASE_URL}/rest/v1/merton_trades",
-            headers=_supabase_headers(),
-            json=row,
-            timeout=5,
-        )
-    except Exception as e:
-        log.warning("supabase trade push failed: %s", e)
+    _supabase_post("merton_trades", row)
 
 
 # ---------------------------------------------------------------------------
