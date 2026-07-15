@@ -17,8 +17,16 @@ CANDIDATE_POOL = [
     "TMUS", "CMCSA", "NKE", "MCD", "SBUX", "LOW", "TGT", "PM", "MO", "CVS",
     "TMO", "ABT", "DHR", "BMY", "AMGN", "GILD", "ISRG", "NOW", "INTU", "MU",
     "AMAT", "LRCX", "PYPL", "UBER", "ABNB", "PLTR", "COIN", "SHOP", "F", "GM",
+    # --- expansion: 40 more established, liquid S&P large-caps (sector-diverse).
+    # Reaches the less-saturated tier below the mega-cap top-50 while staying
+    # inside names where IEX bars are dense and the 10bps cost model stays honest.
+    "ACN", "LIN", "RTX", "SPGI", "NEE", "PGR", "CB", "ELV", "VRTX", "REGN",
+    "PANW", "SNPS", "CDNS", "KLAC", "ADI", "MDLZ", "ADP", "GD", "LMT", "NOC",
+    "ITW", "EMR", "ETN", "PH", "MMM", "CL", "KMB", "SYK", "BSX", "CI",
+    "ZTS", "BDX", "SO", "DUK", "MMC", "AON", "ICE", "CME", "USB", "PNC",
 ]
-UNIVERSE_SIZE = 50            # trade the top N of the pool by dollar-volume
+UNIVERSE_SIZE = 100          # trade the top N of the pool by dollar-volume
+                             # (was 50; 120-name pool -> ranking still selects)
 UNIVERSE = CANDIDATE_POOL[:8]  # fallback if dynamic selection is unavailable
 MARKET_PROXY = "SPY"          # used by the volatility circuit-breaker
 
@@ -43,15 +51,18 @@ MAX_GROSS_EXPOSURE = 1.0      # sum |position value| <= this * equity (no levera
 MAX_POSITIONS = None          # no count cap: worthiness + gross exposure decide breadth
 PER_SYMBOL_CAP = 0.10         # max fraction of equity per symbol
 MIN_SYMBOL_TRADES = 30        # min backtest trades to judge a symbol's own edge
-MIN_EDGE_RATIO = 0.2551       # worthiness bar: mu_lcb / sigma (return per unit risk).
-                              # STALE -- RE-MEASURE. This 0.2551 was measured by
-                              # run_backtest.py --bootstrap on 2026-07-09, BEFORE the
-                              # net->gross flip fix. The old null sign-flipped NET
-                              # returns, which flips the fixed per-trade cost and
-                              # biases the null ~0.15 too HIGH -> this bar is
-                              # over-conservative and may reject genuine candidates.
-                              # Re-run run_backtest.py --bootstrap 2000 (now fixed)
-                              # and set this to the printed 95th-percentile quantile.
+MIN_EDGE_RATIO = 0.0246       # worthiness bar: mu_lcb / sigma (return per unit risk).
+                              # Set from the CORRECTED null 95th percentile printed by
+                              # run_backtest.py --bootstrap 2000 (2026-07-15 boot),
+                              # after the net->gross sign-flip fix. The prior 0.2551
+                              # was measured pre-fix and biased ~10x too HIGH, which
+                              # would reject genuine marginal candidates.
+                              # NOTE: this does NOT unlock trades today -- the observed
+                              # max edge ratio was -0.0952 (best symbol still negative,
+                              # inside the noise band). This corrected bar only ensures
+                              # a real marginal edge is not wrongly rejected WHEN the
+                              # wider universe / news / reversion search surfaces one.
+                              # Re-measure whenever the universe or cost model changes.
 DAILY_LOSS_HALT = 0.03        # halt new entries if day PnL <= -3% of start equity
 TRAIL_PERCENT = 2.5          # trailing-stop distance (%) — locks gains, cuts losers
 SENSITIVE_EXIT = False        # True = exit on fast (5m) flip; False = on blended flip
