@@ -30,6 +30,17 @@ UNIVERSE_SIZE = 100          # trade the top N of the pool by dollar-volume
 UNIVERSE = CANDIDATE_POOL[:8]  # fallback if dynamic selection is unavailable
 MARKET_PROXY = "SPY"          # used by the volatility circuit-breaker
 
+# When True, the candidate set is built dynamically from the broker asset list
+# (rule-based: active tradable NYSE/NASDAQ common stock, ETFs/leveraged products
+# excluded) and ranked by dollar volume -- see data_feed.dynamic_universe().
+# CANDIDATE_POOL above is then IGNORED for selection, but is retained as the
+# restricted-mode set (flip this False) and as the cold-boot fallback the live
+# runner uses when signal_stats.json is absent. Selection still happens ONCE per
+# backtest run and is written into signal_stats.json; it does NOT re-rank
+# intraday (that would churn the symbol set and break the live-vs-backtest
+# distributional comparison, same reasoning as the pre-open-only stats refresh).
+USE_DYNAMIC_UNIVERSE = True
+
 # --- signal / confluence --------------------------------------------------
 # 5-minute base trigger, with 15m and 30m context (higher TF = more weight).
 TIMEFRAME_WEIGHTS = {"5min": 0.20, "15min": 0.30, "30min": 0.50}
