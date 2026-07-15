@@ -128,9 +128,17 @@ def main():
         print("Credentials not found."); sys.exit(1)
 
     from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.trading.client import TradingClient
     dc = StockHistoricalDataClient(api_key, secret)
+    tc = TradingClient(api_key, secret, paper=True)  # asset list for dynamic universe
 
-    universe = feed.select_universe(dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE)
+    if config.USE_DYNAMIC_UNIVERSE:
+        # Rule-based candidate set (NYSE/NASDAQ common stock, ETFs excluded),
+        # ranked by dollar volume. eval_days=0 -> rank on recent liquidity so the
+        # written universe reflects what live can actually trade tomorrow.
+        universe = feed.dynamic_universe(dc, tc, config.UNIVERSE_SIZE)
+    else:
+        universe = feed.select_universe(dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE)
     if not universe:
         print("Universe selection returned nothing; falling back."); universe = config.UNIVERSE
     print(f"Universe ({len(universe)} by dollar-volume): {', '.join(universe)}\n")
