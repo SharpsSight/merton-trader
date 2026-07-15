@@ -60,6 +60,7 @@ import config
 import trend_signals as ts
 import factors as fac
 import merton
+import merton_alloc  # concurrent portfolio allocator + constant-vol targeting
 import news_overlay as no
 import data_feed as feed
 from backtest import _bucket
@@ -579,6 +580,14 @@ def run():
             action, reason = (no.news_risk_action({}, True) if breaker
                                else (NORMAL, "clear"))
 
+            # ═══════════════════════════════════════════════════════════════
+            # PASS 1 — manage open positions (exits/flips/holds run IMMEDIATELY,
+            # unchanged) and COLLECT entry candidates for joint sizing.
+            # Risk-reducing actions must not wait on the allocator, so they stay
+            # per-symbol and eager here. Only ENTRIES are deferred to Pass 2.
+            # ═══════════════════════════════════════════════════════════════
+            entry_candidates = []
+            symbol_vols = {}
             for sym in universe:
                 try:
                     df = frames.get(sym)
@@ -635,71 +644,98 @@ def run():
                                      sym, held)
                         continue
 
-                    # --- entries ---------------------------------------------
+                    # --- collect entry candidate (sizing deferred to Pass 2) --
                     if sig["direction"] == 0:
                         continue
-                    if sym not in tradeable and not config.PLUMBING_TEST:
+                    if sym not in tradeable:       # worthiness screen (PLUMBING removed)
                         continue
                     if not fresh:
-                        continue  # no entries on stale data
+                        continue                    # no entries on stale data
+                    if mode == "OBSERVE":
+                        continue                    # no stats to size on -> log-only mode
 
                     conf = fac.confirmation(df, sig["direction"])
                     bucket = _bucket(sig["score"])
                     bstats = (stats or {}).get(bucket, {"mu": 0, "sigma": 0, "n": 0})
-
                     bar_ret = df["close"].pct_change().dropna()
                     symbol_vol = float(bar_ret.tail(100).std() * (config.HOLD_BARS ** 0.5))
+                    symbol_vols[sym] = symbol_vol
+                    entry_candidates.append({
+                        "symbol": sym, "direction": sig["direction"], "price": price,
+                        "mu": float(bstats.get("mu", 0.0)),
+                        "sigma": float(bstats.get("sigma", 0.0)),
+                        "n": int(bstats.get("n", 0)), "symbol_vol": symbol_vol,
+                        "confirmation": conf["multiplier"],
+                        "score": sig["score"], "bucket": bucket, "sig": sig})
+                except Exception as e:
+                    log.warning("  %s pass1 error: %s", sym, e)
 
-                    intent = merton.size_position(equity, price, sig["direction"],
-                                                   bstats, symbol_vol, conf["multiplier"])
-
-                    if config.PLUMBING_TEST and intent["shares"] == 0:
-                        # Fixed-size override. Merton said zero; we are placing an
-                        # order anyway to exercise the order path. Not a signal.
-                        sh = int((config.PLUMBING_FRACTION * equity) // price)
-                        if sh > 0:
-                            intent = dict(intent, shares=sh * sig["direction"],
-                                          fraction=config.PLUMBING_FRACTION,
-                                          notional=sh * price)
-
-                    # PLUMBING_TEST must beat the OBSERVE gate, not only the
-                    # sizer. Previously OBSERVE short-circuited every entry here
-                    # even with PLUMBING_TEST=True, so a cold container (no
-                    # signal_stats.json) ran "alive" but placed zero orders.
-                    if (mode == "OBSERVE" and not config.PLUMBING_TEST) \
-                            or intent["shares"] == 0:
-                        log.info("  [obs] %-5s dir=%+d score=%+.2f conf=%.2f vol=%.3f "
-                                 "bucket=%s t=%+.2f mu_lcb=%+.5f would_size=%d",
-                                 sym, sig["direction"], sig["score"], conf["multiplier"],
-                                 symbol_vol, bucket, intent["bucket_t"],
-                                 intent["mu_lcb"], intent["shares"])
+            # ═══════════════════════════════════════════════════════════════
+            # ALLOCATE — concurrent Merton across the whole candidate book,
+            # then constant-volatility scaling to VOL_TARGET_ANNUAL (capped at
+            # the leverage ceiling MAX_GROSS_EXPOSURE). Gates are intact: a name
+            # gets weight ONLY if its bucket clears MIN_BUCKET_T / MIN_BUCKET_N /
+            # mu_lcb>0. Zero-edge book -> zero exposure, by design.
+            # ═══════════════════════════════════════════════════════════════
+            placements = []
+            if entry_candidates and not breaker and action == NORMAL:
+                alloc = merton_alloc.allocate_book(
+                    entry_candidates, equity,
+                    gross_target=config.MAX_GROSS_EXPOSURE,
+                    gamma=config.GAMMA, fractional=config.FRACTIONAL,
+                    z=config.LCB_Z, max_fraction=config.PER_SYMBOL_CAP,
+                    concentration=getattr(config, "CONCENTRATION", 1.0))
+                k, sig0, sig1, gross = merton_alloc.vol_target_scale(
+                    alloc, symbol_vols,
+                    vol_target_annual=config.VOL_TARGET_ANNUAL,
+                    leverage_cap=config.MAX_GROSS_EXPOSURE,
+                    rho=config.BOOK_CORRELATION)
+                gated = sum(1 for a in alloc if a["fraction"] > 0)
+                log.info("ALLOC | cands=%d gated=%d book_sigma=%.2f%%(horizon) "
+                         "k=%.2f target=%.0f%% gross=%.1f%%",
+                         len(entry_candidates), gated, sig0 * 100, k,
+                         config.VOL_TARGET_ANNUAL * 100, gross * 100)
+                if gated == 0:
+                    log.info("  [obs] no bucket cleared MIN_BUCKET_T=%.1f -- 0 entries "
+                             "(this is correct on zero-edge signal, NOT a bug)",
+                             config.MIN_BUCKET_T)
+                cand_by_sym = {c["symbol"]: c for c in entry_candidates}
+                for a in alloc:
+                    if a["fraction"] <= 0:
                         continue
+                    c = cand_by_sym[a["symbol"]]
+                    frac = a["fraction"] * k                       # vol-targeted weight
+                    shares = int((frac * equity) // c["price"]) * a["direction"]
+                    if shares != 0:
+                        placements.append((a["symbol"], shares, frac, c, a))
 
-                    approved, gate = rm.gate_entry(sym, intent["shares"], price,
+            # ═══════════════════════════════════════════════════════════════
+            # PASS 2 — place the jointly-sized entries. Per-symbol/gross caps in
+            # the RiskManager still bind as a final backstop.
+            # ═══════════════════════════════════════════════════════════════
+            for sym, shares, frac, c, a in placements:
+                try:
+                    approved, gate = rm.gate_entry(sym, shares, c["price"],
                                                     positions, equity, action)
                     if approved == 0:
                         log.info("  [gate] %-5s blocked: %s (news=%s)", sym, gate, reason)
                         continue
-
-                    side = place_entry_with_stop(tc, rm, sym, approved, price, sig)
-                    positions[sym] = {"shares": approved, "price": price}
+                    side = place_entry_with_stop(tc, rm, sym, approved, c["price"], c["sig"])
+                    positions[sym] = {"shares": approved, "price": c["price"]}
                     entry_times[sym] = now
                     log.info("  [ORDER] %-5s %s %d @ ~%.2f frac=%.3f vol=%.3f "
                              "score=%+.2f t=%+.2f",
-                             sym, side.value, abs(approved), price,
-                             intent["fraction"], symbol_vol, sig["score"],
-                             intent["bucket_t"])
+                             sym, side.value, abs(approved), c["price"], frac,
+                             c["symbol_vol"], c["score"], a["bucket_t"])
                     log_trade(ts_utc=now.isoformat(), session_date=str(session_date),
-                               symbol=sym, action="ENTER", direction=sig["direction"],
-                               shares=approved, price=price, score=sig["score"],
-                               bucket=bucket, mu_lcb=intent["mu_lcb"],
-                               bucket_t=intent["bucket_t"], fraction=intent["fraction"],
-                               symbol_vol=symbol_vol, conf_mult=conf["multiplier"],
-                               gate=("PLUMBING_TEST" if config.PLUMBING_TEST
-                                     and intent["bucket_t"] < config.MIN_BUCKET_T
-                                     else gate))
+                               symbol=sym, action="ENTER", direction=a["direction"],
+                               shares=approved, price=c["price"], score=c["score"],
+                               bucket=c["bucket"], mu_lcb=a["mu_lcb"],
+                               bucket_t=a["bucket_t"], fraction=frac,
+                               symbol_vol=c["symbol_vol"], conf_mult=c["confirmation"],
+                               gate=gate)
                 except Exception as e:
-                    log.warning("  %s error: %s", sym, e)
+                    log.warning("  %s place error: %s", sym, e)
 
             time.sleep(OPEN_POLL_SECONDS)
 
