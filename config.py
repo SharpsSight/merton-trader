@@ -44,13 +44,14 @@ MAX_POSITIONS = None          # no count cap: worthiness + gross exposure decide
 PER_SYMBOL_CAP = 0.10         # max fraction of equity per symbol
 MIN_SYMBOL_TRADES = 30        # min backtest trades to judge a symbol's own edge
 MIN_EDGE_RATIO = 0.2551       # worthiness bar: mu_lcb / sigma (return per unit risk).
-                              # MEASURED, not guessed: this is the 95th percentile of
-                              # max(edge_ratio) under the date-blocked sign-flip null,
-                              # 2000 resamples, 50 symbols, run 2026-07-09.
-                              # The old value of 0.05 was 5x too lenient -- it admitted
-                              # TSLA at ratio=0.0721, which is BELOW the null median of
-                              # 0.1444 (family-wise p = 0.908).
-                              # Re-measure with: run_backtest.py --bootstrap 2000
+                              # STALE -- RE-MEASURE. This 0.2551 was measured by
+                              # run_backtest.py --bootstrap on 2026-07-09, BEFORE the
+                              # net->gross flip fix. The old null sign-flipped NET
+                              # returns, which flips the fixed per-trade cost and
+                              # biases the null ~0.15 too HIGH -> this bar is
+                              # over-conservative and may reject genuine candidates.
+                              # Re-run run_backtest.py --bootstrap 2000 (now fixed)
+                              # and set this to the printed 95th-percentile quantile.
 DAILY_LOSS_HALT = 0.03        # halt new entries if day PnL <= -3% of start equity
 TRAIL_PERCENT = 2.5          # trailing-stop distance (%) — locks gains, cuts losers
 SENSITIVE_EXIT = False        # True = exit on fast (5m) flip; False = on blended flip
