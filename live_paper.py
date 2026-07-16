@@ -39,12 +39,6 @@ import json
 import time
 import logging
 import subprocess
-# stdlib HTTP for Supabase mirroring. Using urllib (not `requests`) means the
-# import can NEVER fail -- the old `try: import requests / except: requests=None`
-# guard silently no-op'd the ENTIRE dashboard mirror whenever requests wasn't in
-# requirements.txt, which is the most likely reason the tables were empty.
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -58,7 +52,6 @@ import config
 import trend_signals as ts
 import factors as fac
 import merton
-import merton_alloc  # concurrent portfolio allocator + constant-vol targeting
 import news_overlay as no
 import data_feed as feed
 from backtest import _bucket
@@ -71,97 +64,16 @@ from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout,
-                     format="%(asctime)s | %(levelname)s | %(message)s",
-                     datefmt="%Y-%m-%d %H:%M:%S")
+                    format="%(asctime)s | %(levelname)s | %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("runner")
 
 ET = ZoneInfo(config.MARKET_TZ)
-
-
-def _tf_minutes(tf) -> int:
-    """Parse a timeframe key to integer minutes, tolerant of format.
-
-    The old one-liner did ``int(key.replace("min",""))`` which assumes the
-    exact string "5min". If config uses "5m", "15m", "30m" (or an int, or
-    "5 min"), that raised ValueError at MODULE IMPORT and crash-looped the
-    whole process before run() ever executed. Strip to digits instead.
-    """
-    if isinstance(tf, (int, float)):
-        return int(tf)
-    digits = "".join(ch for ch in str(tf) if ch.isdigit())
-    if not digits:
-        raise ValueError(f"cannot parse timeframe minutes from {tf!r}")
-    return int(digits)
-
-
-BASE_BAR_MIN = _tf_minutes(list(config.TIMEFRAME_WEIGHTS)[0])
+BASE_BAR_MIN = int(list(config.TIMEFRAME_WEIGHTS)[0].replace("min", ""))
 MAX_HOLD_SEC = config.MAX_HOLD_BARS * BASE_BAR_MIN * 60 if config.MAX_HOLD_BARS else 0
 OPEN_POLL_SECONDS = 60
 CLOSED_POLL_CAP = 900
-FETCH_DAYS = 15  # trailing history per symbol for warmup
-
-# ---------------------------------------------------------------------------
-# PATCH: push live status / trades to Supabase so an external dashboard can
-# read what this process is actually doing, without scraping Railway logs.
-# Set SUPABASE_SERVICE_KEY in Railway's env vars (Project Settings -> API ->
-# service_role key in Supabase). Never commit that key to the repo.
-# ---------------------------------------------------------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://nrcwewfcvpbzribeahzn.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
-_SUPABASE_WARNED = False
-
-
-def _supabase_ready():
-    """Log ONCE, loudly, if mirroring is off -- so a dead dashboard shows up in
-    the logs instead of silently writing zero rows forever (the old bug)."""
-    global _SUPABASE_WARNED
-    if SUPABASE_KEY:
-        return True
-    if not _SUPABASE_WARNED:
-        log.warning("SUPABASE MIRROR OFF: SUPABASE_SERVICE_KEY is not set. "
-                    "Dashboard tables (merton_status/merton_trades) will stay "
-                    "EMPTY. Set the service_role key in Railway env vars.")
-        _SUPABASE_WARNED = True
-    return False
-
-
-def _supabase_post(table, payload, upsert=False):
-    """POST one row via stdlib urllib. CHECKS the HTTP status and logs non-2xx --
-    a 401 (bad key), 404 (wrong table) or 400 (schema mismatch) is exactly how
-    rows silently never appear even when the key IS set and the import works.
-    Never raises: dashboard mirroring must not crash the trader."""
-    if not _supabase_ready():
-        return
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-    }
-    if upsert:
-        headers["Prefer"] = "resolution=merge-duplicates"
-    req = urllib.request.Request(
-        f"{SUPABASE_URL}/rest/v1/{table}",
-        data=json.dumps(payload, default=str).encode(),
-        headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            if not (200 <= resp.status < 300):
-                log.warning("supabase %s -> HTTP %s", table, resp.status)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="ignore")[:200]
-        log.warning("supabase %s -> HTTP %s: %s", table, e.code, body)
-    except Exception as e:
-        log.warning("supabase %s push failed: %s", table, e)
-
-
-def push_status(**row):
-    """Upsert the single live-status row so the dashboard can read current state."""
-    _supabase_post("merton_status", {"id": "live", **row}, upsert=True)
-
-
-def push_trade(**row):
-    """Insert one trade/order event, same schema as log_trade's CSV."""
-    _supabase_post("merton_trades", row)
+FETCH_DAYS = 15               # trailing history per symbol for warmup
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +150,7 @@ def close_position_safely(tc, symbol) -> bool:
         try:
             p = tc.get_open_position(symbol)
         except Exception:
-            return True  # already flat
+            return True                       # already flat
         try:
             qty = abs(int(float(p.qty)))
             available = abs(int(float(getattr(p, "qty_available", p.qty))))
@@ -274,7 +186,7 @@ def place_entry_with_stop(tc, rm, symbol, approved, price, sig):
     leaving multi-day holds naked)."""
     side = OrderSide.BUY if approved > 0 else OrderSide.SELL
     tc.submit_order(MarketOrderRequest(symbol=symbol, qty=abs(approved),
-                                        side=side, time_in_force=TimeInForce.DAY))
+                                       side=side, time_in_force=TimeInForce.DAY))
     place_trailing_stop(tc, symbol, abs(approved), approved > 0)
     return side
 
@@ -293,8 +205,8 @@ def open_order_symbols(tc):
 # live trade log -- the input the diagnostics module needs and never had
 # ---------------------------------------------------------------------------
 _TRADE_FIELDS = ["ts_utc", "session_date", "symbol", "action", "direction",
-                  "shares", "price", "score", "bucket", "mu_lcb", "bucket_t",
-                  "fraction", "symbol_vol", "conf_mult", "gate"]
+                 "shares", "price", "score", "bucket", "mu_lcb", "bucket_t",
+                 "fraction", "symbol_vol", "conf_mult", "gate"]
 
 
 def log_trade(**row):
@@ -310,7 +222,6 @@ def log_trade(**row):
             w.writerow(row)
     except Exception as e:
         log.warning("trade-log write failed: %s", e)
-    push_trade(**row)  # PATCH: mirror every trade event into Supabase
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +292,7 @@ def maybe_refresh_stats(clock, session_date, generated_at) -> bool:
             log.info("  bt| %s", line)
         if r.returncode != 0:
             log.error("STATS | refresh FAILED rc=%d: %s", r.returncode,
-                       (r.stderr or "")[-2000:])
+                      (r.stderr or "")[-2000:])
             return False
     except Exception as e:
         log.error("STATS | refresh raised: %s", e)
@@ -474,29 +385,21 @@ def run():
         log.warning("=" * 78)
         log.warning("PLUMBING_TEST ENABLED. Merton sizing is BYPASSED. Every signal is")
         log.warning("sized at a fixed %.1f%% of equity regardless of mu, sigma, or n.",
-                     config.PLUMBING_FRACTION * 100)
+                    config.PLUMBING_FRACTION * 100)
         log.warning("P&L from this mode carries NO information about edge. It exists to")
         log.warning("exercise the order path and populate %s.", config.LIVE_TRADES_PATH)
         log.warning("The `tradeable` screen is ALSO bypassed: every symbol in the")
         log.warning("universe can enter, not just the %d that cleared MIN_EDGE_RATIO.",
-                     len(tradeable))
+                    len(tradeable))
         log.warning("Risk caps still bind: PER_SYMBOL_CAP=%.0f%%, MAX_GROSS=%.0f%%.",
-                     config.PER_SYMBOL_CAP * 100, config.MAX_GROSS_EXPOSURE * 100)
+                    config.PER_SYMBOL_CAP * 100, config.MAX_GROSS_EXPOSURE * 100)
         log.warning("If this account is funded, KILL THE PROCESS NOW.")
         log.warning("=" * 78)
     reconcile(tc, current_positions(tc), session_date)
 
-    # PATCH: push an initial status row immediately at startup, so the
-    # dashboard shows something even before the first HEARTBEAT cycle.
-    push_status(mode=mode, session_date=str(session_date), equity=equity,
-                positions_count=0, universe_size=len(universe),
-                tradeable_size=len(tradeable), breaker=False,
-                halt_latched=False, bar_age_sec=0,
-                stats_generated_at=generated_at)
-
     while True:
         try:
-            now = datetime.now(timezone.utc)  # defined EVERY iteration
+            now = datetime.now(timezone.utc)          # defined EVERY iteration
             clock = tc.get_clock()
             today = session_date_of(clock)
 
@@ -506,7 +409,7 @@ def run():
                 session_date = today
                 acct = tc.get_account()
                 equity = float(acct.equity)
-                rm.new_session(equity, session_date)  # start_equity + halt latch
+                rm.new_session(equity, session_date)    # start_equity + halt latch
                 breaker_cooldown = 0
                 entry_times.clear()
                 reconcile(tc, current_positions(tc), session_date)
@@ -521,7 +424,7 @@ def run():
                              "generated=%s", mode, len(universe), len(tradeable),
                              generated_at)
                 nap = max(30, min((clock.next_open - now).total_seconds(),
-                                   CLOSED_POLL_CAP))
+                                  CLOSED_POLL_CAP))
                 log.info("Market CLOSED. Next open %s. Idling %.0fs.",
                          clock.next_open, nap)
                 time.sleep(nap); continue
@@ -547,7 +450,7 @@ def run():
 
             # ---------- data ------------------------------------------------
             frames = feed.fetch_bars_batch(dc, universe + [config.MARKET_PROXY],
-                                            FETCH_DAYS)
+                                           FETCH_DAYS)
             fresh, age = bars_are_fresh(frames, universe, now)
             if not fresh:
                 log.error("DATA STALE | newest bar is %.0fs old (cap %ds) -- "
@@ -582,26 +485,9 @@ def run():
                      f" (cooldown {breaker_cooldown})" if breaker_cooldown else "",
                      rm.halt_latched, age)
 
-            # PATCH: mirror the heartbeat into Supabase so the dashboard's
-            # "Merton Trader — Live Status" panel reflects reality in near
-            # real time (this loop ticks roughly every OPEN_POLL_SECONDS).
-            push_status(mode=mode, session_date=str(session_date), equity=equity,
-                        positions_count=len(positions), universe_size=len(universe),
-                        tradeable_size=len(tradeable), breaker=bool(breaker),
-                        halt_latched=bool(rm.halt_latched), bar_age_sec=age,
-                        stats_generated_at=generated_at)
-
             action, reason = (no.news_risk_action({}, True) if breaker
-                               else (NORMAL, "clear"))
+                              else (NORMAL, "clear"))
 
-            # ═══════════════════════════════════════════════════════════════
-            # PASS 1 — manage open positions (exits/flips/holds run IMMEDIATELY,
-            # unchanged) and COLLECT entry candidates for joint sizing.
-            # Risk-reducing actions must not wait on the allocator, so they stay
-            # per-symbol and eager here. Only ENTRIES are deferred to Pass 2.
-            # ═══════════════════════════════════════════════════════════════
-            entry_candidates = []
-            symbol_vols = {}
             for sym in universe:
                 try:
                     df = frames.get(sym)
@@ -618,25 +504,25 @@ def run():
                     # --- manage existing positions (exits ALWAYS run) --------
                     if plan in ("EXIT", "FLIP"):
                         if not close_position_safely(tc, sym):
-                            continue  # still holding; retry next cycle
+                            continue                    # still holding; retry next cycle
                         log.info("  [CLOSE] %-5s %s (held %+d) score=%+.2f",
                                  sym, plan, held, sig["score"])
                         log_trade(ts_utc=now.isoformat(), session_date=str(session_date),
-                                   symbol=sym, action=plan, direction=held_dir,
-                                   shares=-held, price=price, score=sig["score"],
-                                   bucket=_bucket(sig["score"]), gate="exit")
+                                  symbol=sym, action=plan, direction=held_dir,
+                                  shares=-held, price=price, score=sig["score"],
+                                  bucket=_bucket(sig["score"]), gate="exit")
                         positions.pop(sym, None)
                         entry_times.pop(sym, None)
                         if plan == "EXIT":
                             continue
-                        held_dir = 0  # FLIP falls through to enter
+                        held_dir = 0                    # FLIP falls through to enter
 
                     if plan == "HOLD":
                         # hard holding-time cap: exit regardless of signal
                         if MAX_HOLD_SEC and held != 0:
                             t0 = entry_times.get(sym)
                             if t0 is None:
-                                entry_times[sym] = now  # inherited; start clock
+                                entry_times[sym] = now      # inherited; start clock
                             elif (now - t0).total_seconds() >= MAX_HOLD_SEC:
                                 if close_position_safely(tc, sym):
                                     log.info("  [MAXHOLD] %-5s closed after %.0f min "
@@ -644,11 +530,11 @@ def run():
                                              (now - t0).total_seconds() / 60,
                                              config.MAX_HOLD_BARS, sig["score"])
                                     log_trade(ts_utc=now.isoformat(),
-                                               session_date=str(session_date), symbol=sym,
-                                               action="MAXHOLD", direction=held_dir,
-                                               shares=-held, price=price,
-                                               score=sig["score"],
-                                               bucket=_bucket(sig["score"]), gate="max_hold")
+                                              session_date=str(session_date), symbol=sym,
+                                              action="MAXHOLD", direction=held_dir,
+                                              shares=-held, price=price,
+                                              score=sig["score"],
+                                              bucket=_bucket(sig["score"]), gate="max_hold")
                                     positions.pop(sym, None)
                                     entry_times.pop(sym, None)
                                 continue
@@ -658,98 +544,81 @@ def run():
                                      sym, held)
                         continue
 
-                    # --- collect entry candidate (sizing deferred to Pass 2) --
+                    # --- entries ---------------------------------------------
                     if sig["direction"] == 0:
                         continue
-                    if sym not in tradeable:       # worthiness screen (PLUMBING removed)
+                    if sym not in tradeable and not config.PLUMBING_TEST:
                         continue
                     if not fresh:
-                        continue                    # no entries on stale data
-                    if mode == "OBSERVE":
-                        continue                    # no stats to size on -> log-only mode
+                        continue                        # no entries on stale data
 
                     conf = fac.confirmation(df, sig["direction"])
                     bucket = _bucket(sig["score"])
                     bstats = (stats or {}).get(bucket, {"mu": 0, "sigma": 0, "n": 0})
+
                     bar_ret = df["close"].pct_change().dropna()
                     symbol_vol = float(bar_ret.tail(100).std() * (config.HOLD_BARS ** 0.5))
-                    symbol_vols[sym] = symbol_vol
-                    entry_candidates.append({
-                        "symbol": sym, "direction": sig["direction"], "price": price,
-                        "mu": float(bstats.get("mu", 0.0)),
-                        "sigma": float(bstats.get("sigma", 0.0)),
-                        "n": int(bstats.get("n", 0)), "symbol_vol": symbol_vol,
-                        "confirmation": conf["multiplier"],
-                        "score": sig["score"], "bucket": bucket, "sig": sig})
-                except Exception as e:
-                    log.warning("  %s pass1 error: %s", sym, e)
 
-            # ═══════════════════════════════════════════════════════════════
-            # ALLOCATE — concurrent Merton across the whole candidate book,
-            # then constant-volatility scaling to VOL_TARGET_ANNUAL (capped at
-            # the leverage ceiling MAX_GROSS_EXPOSURE). Gates are intact: a name
-            # gets weight ONLY if its bucket clears MIN_BUCKET_T / MIN_BUCKET_N /
-            # mu_lcb>0. Zero-edge book -> zero exposure, by design.
-            # ═══════════════════════════════════════════════════════════════
-            placements = []
-            if entry_candidates and not breaker and action == NORMAL:
-                alloc = merton_alloc.allocate_book(
-                    entry_candidates, equity,
-                    gross_target=config.MAX_GROSS_EXPOSURE,
-                    gamma=config.GAMMA, fractional=config.FRACTIONAL,
-                    z=config.LCB_Z, max_fraction=config.PER_SYMBOL_CAP,
-                    concentration=getattr(config, "CONCENTRATION", 1.0))
-                k, sig0, sig1, gross = merton_alloc.vol_target_scale(
-                    alloc, symbol_vols,
-                    vol_target_annual=config.VOL_TARGET_ANNUAL,
-                    leverage_cap=config.MAX_GROSS_EXPOSURE,
-                    rho=config.BOOK_CORRELATION)
-                gated = sum(1 for a in alloc if a["fraction"] > 0)
-                log.info("ALLOC | cands=%d gated=%d book_sigma=%.2f%%(horizon) "
-                         "k=%.2f target=%.0f%% gross=%.1f%%",
-                         len(entry_candidates), gated, sig0 * 100, k,
-                         config.VOL_TARGET_ANNUAL * 100, gross * 100)
-                if gated == 0:
-                    log.info("  [obs] no bucket cleared MIN_BUCKET_T=%.1f -- 0 entries "
-                             "(this is correct on zero-edge signal, NOT a bug)",
-                             config.MIN_BUCKET_T)
-                cand_by_sym = {c["symbol"]: c for c in entry_candidates}
-                for a in alloc:
-                    if a["fraction"] <= 0:
+                    intent = merton.size_position(equity, price, sig["direction"],
+                                                  bstats, symbol_vol, conf["multiplier"])
+
+                    if config.PLUMBING_TEST and intent["shares"] == 0:
+                        # Fixed-size override. Merton said zero (no positive edge);
+                        # we place an order anyway to exercise the order path.
+                        #
+                        # CONFIDENCE-WEIGHTED sizing (still NOT edge-based -- the
+                        # weight is the signal's own |score|, not mu, because mu is
+                        # not positive). A |score|=0.9 conviction gets a bigger
+                        # slice than a |score|=0.35 marginal one, and the fraction
+                        # rebalances as the score moves. Interpolates linearly from
+                        # PLUMBING_FRACTION_MIN at ENTRY_THRESHOLD to
+                        # PLUMBING_FRACTION at |score|=1.0.
+                        lo = config.ENTRY_THRESHOLD
+                        conviction = (abs(sig["score"]) - lo) / max(1e-9, 1.0 - lo)
+                        conviction = min(1.0, max(0.0, conviction))
+                        frac = (config.PLUMBING_FRACTION_MIN
+                                + conviction * (config.PLUMBING_FRACTION
+                                                - config.PLUMBING_FRACTION_MIN))
+                        # factor-confirmation multiplier tilts it a little more
+                        frac *= max(0.25, min(1.0, conf["multiplier"]))
+                        sh = int((frac * equity) // price)
+                        if sh > 0:
+                            intent = dict(intent, shares=sh * sig["direction"],
+                                          fraction=frac, notional=sh * price)
+
+                    if mode == "OBSERVE" or intent["shares"] == 0:
+                        log.info("  [obs] %-5s dir=%+d score=%+.2f conf=%.2f vol=%.3f "
+                                 "bucket=%s t=%+.2f mu_lcb=%+.5f would_size=%d",
+                                 sym, sig["direction"], sig["score"], conf["multiplier"],
+                                 symbol_vol, bucket, intent["bucket_t"],
+                                 intent["mu_lcb"], intent["shares"])
                         continue
-                    c = cand_by_sym[a["symbol"]]
-                    frac = a["fraction"] * k                       # vol-targeted weight
-                    shares = int((frac * equity) // c["price"]) * a["direction"]
-                    if shares != 0:
-                        placements.append((a["symbol"], shares, frac, c, a))
 
-            # ═══════════════════════════════════════════════════════════════
-            # PASS 2 — place the jointly-sized entries. Per-symbol/gross caps in
-            # the RiskManager still bind as a final backstop.
-            # ═══════════════════════════════════════════════════════════════
-            for sym, shares, frac, c, a in placements:
-                try:
-                    approved, gate = rm.gate_entry(sym, shares, c["price"],
-                                                    positions, equity, action)
+                    approved, gate = rm.gate_entry(sym, intent["shares"], price,
+                                                   positions, equity, action)
                     if approved == 0:
                         log.info("  [gate] %-5s blocked: %s (news=%s)", sym, gate, reason)
                         continue
-                    side = place_entry_with_stop(tc, rm, sym, approved, c["price"], c["sig"])
-                    positions[sym] = {"shares": approved, "price": c["price"]}
+
+                    side = place_entry_with_stop(tc, rm, sym, approved, price, sig)
+                    positions[sym] = {"shares": approved, "price": price}
                     entry_times[sym] = now
                     log.info("  [ORDER] %-5s %s %d @ ~%.2f frac=%.3f vol=%.3f "
                              "score=%+.2f t=%+.2f",
-                             sym, side.value, abs(approved), c["price"], frac,
-                             c["symbol_vol"], c["score"], a["bucket_t"])
+                             sym, side.value, abs(approved), price,
+                             intent["fraction"], symbol_vol, sig["score"],
+                             intent["bucket_t"])
                     log_trade(ts_utc=now.isoformat(), session_date=str(session_date),
-                               symbol=sym, action="ENTER", direction=a["direction"],
-                               shares=approved, price=c["price"], score=c["score"],
-                               bucket=c["bucket"], mu_lcb=a["mu_lcb"],
-                               bucket_t=a["bucket_t"], fraction=frac,
-                               symbol_vol=c["symbol_vol"], conf_mult=c["confirmation"],
-                               gate=gate)
+                              symbol=sym, action="ENTER", direction=sig["direction"],
+                              shares=approved, price=price, score=sig["score"],
+                              bucket=bucket, mu_lcb=intent["mu_lcb"],
+                              bucket_t=intent["bucket_t"], fraction=intent["fraction"],
+                              symbol_vol=symbol_vol, conf_mult=conf["multiplier"],
+                              gate=("PLUMBING_TEST" if config.PLUMBING_TEST
+                                    and intent["bucket_t"] < config.MIN_BUCKET_T
+                                    else gate))
                 except Exception as e:
-                    log.warning("  %s place error: %s", sym, e)
+                    log.warning("  %s error: %s", sym, e)
 
             time.sleep(OPEN_POLL_SECONDS)
 
