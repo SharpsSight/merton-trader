@@ -29,7 +29,9 @@ MARKET_PROXY = "SPY"          # used by the volatility circuit-breaker
 # 5-minute base trigger, with 15m and 30m context (higher TF = more weight).
 TIMEFRAME_WEIGHTS = {"5min": 0.20, "15min": 0.30, "30min": 0.50}
 ADX_THRESHOLD = 25.0
-ENTRY_THRESHOLD = 0.30        # |confluence score| must exceed this to take a side
+ENTRY_THRESHOLD = 0.15        # |confluence score| must exceed this to take a side
+                              # Lowered from 0.30: far more signals cross, so the
+                              # book stays populated. More trades, same zero edge.
 
 # --- Merton sizer ---------------------------------------------------------
 # f* = fractional * mu_lcb / (gamma * symbol_vol^2), clipped to [0, MAX_FRACTION]
@@ -144,7 +146,15 @@ MIN_BUCKET_N = 100            # and this many trades in the bucket
 #
 # NEVER set this True against a funded account.
 PLUMBING_TEST = True
-PLUMBING_FRACTION = 0.10      # fraction of equity per position when enabled
+PLUMBING_FRACTION = 0.12      # MAX fraction, at |score|=1.0 (full conviction)
+PLUMBING_FRACTION_MIN = 0.03  # MIN fraction, at |score|=ENTRY_THRESHOLD (marginal)
+                              # Size scales linearly with the signal's own |score|
+                              # between these two. This is confidence-PROPORTIONAL,
+                              # not edge-proportional: it concentrates capital where
+                              # the signal is loudest, but loud != profitable. The
+                              # measured edge is still zero. Real edge-weighting is
+                              # the Merton sizer (PLUMBING_TEST=False), which sizes
+                              # zero here because mu_lcb <= 0.
 
 # --- daily operation ------------------------------------------------------
 MARKET_TZ = "America/New_York"
