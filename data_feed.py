@@ -25,13 +25,6 @@ REMAINING KNOWN BIAS (documented, not fixed here):
   IEX prints are a subset of consolidated prints, so IEX bar lows are >= true
   lows and highs <= true highs. The backtest's trailing stops therefore trigger
   LESS often than a real stop would. Fixing this needs the SIP feed (~$99/mo).
-
-UNIVERSE SELECTION (this file):
-  dynamic_universe() builds the candidate set from a RULE, not a hardcoded list:
-  active tradable US equities on NYSE/NASDAQ, minus ETFs/leveraged products and
-  odd share classes, then ranked POINT-IN-TIME by dollar volume. See the long
-  note above dynamic_universe() for the two biases this design avoids and the
-  one (IEX thin-tail volume) it cannot until SIP.
 """
 
 from __future__ import annotations
@@ -52,36 +45,6 @@ _ET = ZoneInfo(config.MARKET_TZ)
 
 _ADJ = {"raw": Adjustment.RAW, "split": Adjustment.SPLIT,
         "dividend": Adjustment.DIVIDEND, "all": Adjustment.ALL}
-
-# --- universe-rule constants ----------------------------------------------
-# Common stock lists on NYSE/NASDAQ. The bulk of ETFs and every leveraged/
-# inverse product lists on ARCA or BATS, so an exchange whitelist is a cheap,
-# maintenance-free ETF filter that Alpaca's asset object does NOT give directly
-# (there is no reliable is_etf flag). This is a heuristic, not a guarantee --
-# a handful of ETFs list on NASDAQ (e.g. QQQ), which is why we ALSO carry an
-# explicit exclude set below.
-_ALLOWED_EXCHANGES = {"NYSE", "NASDAQ"}
-
-# Belt-and-suspenders: the highest-dollar-volume names on the whole tape are
-# index/leveraged ETFs, so without this they would dominate a volume ranking
-# and quietly replace your equity universe with products the signal was never
-# built for. Extend as needed; this is not meant to be exhaustive of all ETFs,
-# only of the ones liquid enough to crack a top-N dollar-volume screen.
-_EXCLUDE_SYMBOLS = {
-    "SPY", "QQQ", "IWM", "DIA", "VOO", "VTI", "IVV", "VEA", "VWO", "EFA",
-    "EEM", "GLD", "SLV", "TLT", "HYG", "LQD", "XLF", "XLE", "XLK", "XLV",
-    "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC", "SMH", "SOXX", "ARKK",
-    "TQQQ", "SQQQ", "SOXL", "SOXS", "TNA", "TZA", "SPXL", "SPXS", "UVXY",
-    "VXX", "SVXY", "UPRO", "SPXU", "LABU", "LABD", "TSLL", "NVDL", "USO",
-    "BITO", "GDX", "GDXJ", "KWEB", "FXI", "VXUS", "BND", "AGG", "SCHD",
-}
-
-# Fallback so a failed/empty broker pull NEVER leaves the runner with an empty
-# universe (which would silently disable all trading). These are stable, liquid,
-# unambiguous common stocks; the dynamic pull replaces them whenever it succeeds.
-_SEED_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO", "JPM", "V",
-]
 
 
 def filter_rth(df):
@@ -156,123 +119,73 @@ def fetch_bars_batch(dc, symbols, days, timeframe=BAR_5M, end=None) -> dict:
     return out
 
 
-# ---------------------------------------------------------------------------
-def list_tradable_equities(tc) -> list:
-    """Rule-based candidate set: active, tradable US common stock on NYSE/NASDAQ.
-
-    Replaces a hardcoded CANDIDATE_POOL. Uses the TRADING client's asset list,
-    not the data client. Alpaca's Asset has no reliable is_etf flag, so ETFs are
-    excluded heuristically by exchange (ARCA/BATS listings are dropped) plus an
-    explicit _EXCLUDE_SYMBOLS set for the liquid ETFs that list on NASDAQ. Odd
-    share classes / units / warrants (symbols containing '.' or '/') are dropped.
-
-    Returns a bare symbol list (UNRANKED). dynamic_universe() ranks it.
+def select_universe(dc, pool, top_n, lookback_days=10) -> list:
     """
-    try:
-        from alpaca.trading.requests import GetAssetsRequest
-        from alpaca.trading.enums import AssetClass, AssetStatus
-        req = GetAssetsRequest(status=AssetStatus.ACTIVE,
-                               asset_class=AssetClass.US_EQUITY)
-        assets = tc.get_all_assets(req)
-    except Exception as e:
-        print(f"list_tradable_equities: asset pull failed ({e}). "
-              f"Falling back to seed universe.")
-        return list(_SEED_UNIVERSE)
+    Rank the candidate pool by recent average DOLLAR-volume (price * shares)
+    and return the top_n symbols.
 
-    syms = []
-    for a in assets:
-        sym = getattr(a, "symbol", "")
-        if not sym or not getattr(a, "tradable", False):
-            continue
-        if "." in sym or "/" in sym:
-            continue
-        exch = str(getattr(a, "exchange", "") or "")
-        # AssetExchange enum stringifies to e.g. 'AssetExchange.NASDAQ'; take tail
-        exch = exch.split(".")[-1]
-        if exch not in _ALLOWED_EXCHANGES:
-            continue
-        if sym in _EXCLUDE_SYMBOLS:
-            continue
-        syms.append(sym)
-    if not syms:
-        print("list_tradable_equities: rule produced 0 names. Seed fallback.")
-        return list(_SEED_UNIVERSE)
-    return syms
-
-
-def rank_by_dollar_volume(dc, pool, top_n, lookback_days=10, end=None,
-                          eval_days=0) -> list:
-    """Rank `pool` by average dollar-volume (price*shares) and return top_n.
-
-    POINT-IN-TIME: the ranking window ENDS at (end - eval_days), i.e. strictly
-    BEFORE the backtest's evaluation window begins. This is the fix for the
-    selection-on-outcome bias the old select_universe carried: previously the
-    10-day ranking lookback overlapped the eval window, so a name that spiked on
-    news during the sample entered the universe BECAUSE of the very move it was
-    then scored on. Pass eval_days = the backtest --days so selection and
-    evaluation never share a single bar. For live selection pass eval_days=0.
+    NOTE: this lookback overlaps the backtest's evaluation window, so the
+    universe is partly chosen using the data it is then evaluated on. A name
+    that spiked on news lands in the universe precisely because it had unusual
+    price action in the sample. Mild, but it is one reason `tradeable` is
+    unstable across deploys.
     """
-    end = end or datetime.now(timezone.utc)
-    rank_end = end - timedelta(days=eval_days)
-    frames = fetch_bars_batch(dc, pool, lookback_days, BAR_DAY, end=rank_end)
+    frames = fetch_bars_batch(dc, pool, lookback_days, BAR_DAY)
     ranked = []
     for sym, df in frames.items():
         if df is None or len(df) == 0:
             continue
         dollar_vol = float((df["close"] * df["volume"]).mean())
-        if dollar_vol <= 0:
-            continue
         ranked.append((sym, dollar_vol))
     ranked.sort(key=lambda x: x[1], reverse=True)
     return [s for s, _ in ranked[:top_n]]
 
 
-def dynamic_universe(dc, tc, top_n, lookback_days=10, end=None,
-                     eval_days=0) -> list:
-    """Volume-driven universe with NO hardcoded candidate list.
+def dynamic_universe(dc, tc, top_n, lookback_days=10, min_price=5.0):
+    """Rank the whole liquid US equity market by recent dollar-volume.
 
-        1. list_tradable_equities(tc)  -> rule-based candidate set (NYSE/NASDAQ
-           common stock, ETFs/leveraged excluded).
-        2. rank_by_dollar_volume(...)  -> point-in-time top_n by dollar volume.
+    Uses the broker's asset list (active, tradable, fractionable common stock on
+    NYSE/NASDAQ) instead of a hand-maintained CANDIDATE_POOL, then ranks by
+    dollar-volume exactly like select_universe. Falls back to select_universe on
+    any failure so a broker hiccup can never leave the universe empty.
 
-    WHAT THIS BUYS: no maintained CANDIDATE_POOL, and the universe adapts as
-    liquidity shifts -- while staying STABLE within one backtest run (it is
-    selected once per run_backtest, then written into signal_stats.json, exactly
-    like before). It does NOT re-select intraday; that would churn the symbol set
-    within a session and break the live-vs-backtest distributional comparison the
-    same way an intraday mu/sigma refresh would.
-
-    TWO BIASES THIS DESIGN AVOIDS:
-      - listless != junk: the exchange rule + exclude set keep SPY/QQQ/TQQQ and
-        other high-volume ETFs OUT, so the ranking returns the most liquid
-        STOCKS, not the most liquid products.
-      - point-in-time: selection window ends before the eval window (eval_days),
-        so names are not chosen on the same price action they are scored on.
-
-    THE BIAS IT CANNOT AVOID (yet):
-      IEX volume is ~2-3% of consolidated. Near the rank-`top_n` cutoff this is a
-      thin, noisy proxy for true liquidity and borderline names will shuffle run
-      to run. Mega-caps are unaffected; the tail is approximate until SIP.
-
-    RUNTIME: the candidate set is large (thousands of symbols), so step 2 fetches
-    many daily bars. Fine for the nightly pre-open refresh; heavy for a mid-
-    session redeploy. Prefer running universe selection in the pre-open window.
+    NOTE: a larger universe is more names, not more edge. The pooled backtest has
+    shown zero gross edge whether the universe is 50 or 100 symbols; broadening
+    it changes volume, not mu.
     """
-    pool = list_tradable_equities(tc)
-    universe = rank_by_dollar_volume(dc, pool, top_n,
-                                     lookback_days=lookback_days,
-                                     end=end, eval_days=eval_days)
-    return universe or list(_SEED_UNIVERSE)
+    try:
+        from alpaca.trading.requests import GetAssetsRequest
+        from alpaca.trading.enums import AssetClass, AssetStatus, AssetExchange
+        assets = tc.get_all_assets(GetAssetsRequest(
+            status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY))
+        syms = [a.symbol for a in assets
+                if a.tradable and getattr(a, "fractionable", False)
+                and a.exchange in (AssetExchange.NYSE, AssetExchange.NASDAQ)
+                and "." not in a.symbol and "/" not in a.symbol]
+        if not syms:
+            raise ValueError("no tradable assets returned")
+    except Exception as e:
+        print(f"dynamic_universe: asset list failed ({e}); "
+              f"falling back to CANDIDATE_POOL")
+        import config
+        return select_universe(dc, config.CANDIDATE_POOL, top_n, lookback_days)
 
-
-def select_universe(dc, pool, top_n, lookback_days=10, end=None,
-                    eval_days=0) -> list:
-    """Backward-compatible ranking of a GIVEN pool by dollar-volume.
-
-    Retained so existing callers that pass config.CANDIDATE_POOL keep working.
-    Now supports point-in-time selection via end/eval_days (see
-    rank_by_dollar_volume). New code should prefer dynamic_universe(), which
-    also builds the candidate set from a rule instead of a hardcoded list.
-    """
-    return rank_by_dollar_volume(dc, pool, top_n, lookback_days=lookback_days,
-                                 end=end, eval_days=eval_days)
+    # rank in batches to respect the bars request size, keep the top_n by $-vol
+    ranked = []
+    B = 400
+    for i in range(0, len(syms), B):
+        chunk = syms[i:i + B]
+        frames = fetch_bars_batch(dc, chunk, lookback_days, BAR_DAY)
+        for sym, df in frames.items():
+            if df is None or len(df) == 0:
+                continue
+            px = float(df["close"].iloc[-1])
+            if px < min_price:
+                continue
+            ranked.append((sym, float((df["close"] * df["volume"]).mean())))
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    out = [s for s, _ in ranked[:top_n]]
+    if not out:
+        import config
+        return select_universe(dc, config.CANDIDATE_POOL, top_n, lookback_days)
+    return out
