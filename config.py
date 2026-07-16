@@ -19,6 +19,9 @@ CANDIDATE_POOL = [
     "AMAT", "LRCX", "PYPL", "UBER", "ABNB", "PLTR", "COIN", "SHOP", "F", "GM",
 ]
 UNIVERSE_SIZE = 50            # trade the top N of the pool by dollar-volume
+# True  = rank the whole liquid market by dollar-volume (feed.dynamic_universe).
+# False = rank the fixed CANDIDATE_POOL (feed.select_universe).
+USE_DYNAMIC_UNIVERSE = True
 UNIVERSE = CANDIDATE_POOL[:8]  # fallback if dynamic selection is unavailable
 MARKET_PROXY = "SPY"          # used by the volatility circuit-breaker
 
