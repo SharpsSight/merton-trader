@@ -17,29 +17,10 @@ CANDIDATE_POOL = [
     "TMUS", "CMCSA", "NKE", "MCD", "SBUX", "LOW", "TGT", "PM", "MO", "CVS",
     "TMO", "ABT", "DHR", "BMY", "AMGN", "GILD", "ISRG", "NOW", "INTU", "MU",
     "AMAT", "LRCX", "PYPL", "UBER", "ABNB", "PLTR", "COIN", "SHOP", "F", "GM",
-    # --- expansion: 40 more established, liquid S&P large-caps (sector-diverse).
-    # Reaches the less-saturated tier below the mega-cap top-50 while staying
-    # inside names where IEX bars are dense and the 10bps cost model stays honest.
-    "ACN", "LIN", "RTX", "SPGI", "NEE", "PGR", "CB", "ELV", "VRTX", "REGN",
-    "PANW", "SNPS", "CDNS", "KLAC", "ADI", "MDLZ", "ADP", "GD", "LMT", "NOC",
-    "ITW", "EMR", "ETN", "PH", "MMM", "CL", "KMB", "SYK", "BSX", "CI",
-    "ZTS", "BDX", "SO", "DUK", "MMC", "AON", "ICE", "CME", "USB", "PNC",
 ]
-UNIVERSE_SIZE = 100          # trade the top N of the pool by dollar-volume
-                             # (was 50; 120-name pool -> ranking still selects)
+UNIVERSE_SIZE = 50            # trade the top N of the pool by dollar-volume
 UNIVERSE = CANDIDATE_POOL[:8]  # fallback if dynamic selection is unavailable
 MARKET_PROXY = "SPY"          # used by the volatility circuit-breaker
-
-# When True, the candidate set is built dynamically from the broker asset list
-# (rule-based: active tradable NYSE/NASDAQ common stock, ETFs/leveraged products
-# excluded) and ranked by dollar volume -- see data_feed.dynamic_universe().
-# CANDIDATE_POOL above is then IGNORED for selection, but is retained as the
-# restricted-mode set (flip this False) and as the cold-boot fallback the live
-# runner uses when signal_stats.json is absent. Selection still happens ONCE per
-# backtest run and is written into signal_stats.json; it does NOT re-rank
-# intraday (that would churn the symbol set and break the live-vs-backtest
-# distributional comparison, same reasoning as the pre-open-only stats refresh).
-USE_DYNAMIC_UNIVERSE = True
 
 # --- signal / confluence --------------------------------------------------
 # 5-minute base trigger, with 15m and 30m context (higher TF = more weight).
@@ -62,18 +43,14 @@ MAX_GROSS_EXPOSURE = 1.0      # sum |position value| <= this * equity (no levera
 MAX_POSITIONS = None          # no count cap: worthiness + gross exposure decide breadth
 PER_SYMBOL_CAP = 0.10         # max fraction of equity per symbol
 MIN_SYMBOL_TRADES = 30        # min backtest trades to judge a symbol's own edge
-MIN_EDGE_RATIO = 0.0246       # worthiness bar: mu_lcb / sigma (return per unit risk).
-                              # Set from the CORRECTED null 95th percentile printed by
-                              # run_backtest.py --bootstrap 2000 (2026-07-15 boot),
-                              # after the net->gross sign-flip fix. The prior 0.2551
-                              # was measured pre-fix and biased ~10x too HIGH, which
-                              # would reject genuine marginal candidates.
-                              # NOTE: this does NOT unlock trades today -- the observed
-                              # max edge ratio was -0.0952 (best symbol still negative,
-                              # inside the noise band). This corrected bar only ensures
-                              # a real marginal edge is not wrongly rejected WHEN the
-                              # wider universe / news / reversion search surfaces one.
-                              # Re-measure whenever the universe or cost model changes.
+MIN_EDGE_RATIO = 0.2551       # worthiness bar: mu_lcb / sigma (return per unit risk).
+                              # MEASURED, not guessed: this is the 95th percentile of
+                              # max(edge_ratio) under the date-blocked sign-flip null,
+                              # 2000 resamples, 50 symbols, run 2026-07-09.
+                              # The old value of 0.05 was 5x too lenient -- it admitted
+                              # TSLA at ratio=0.0721, which is BELOW the null median of
+                              # 0.1444 (family-wise p = 0.908).
+                              # Re-measure with: run_backtest.py --bootstrap 2000
 DAILY_LOSS_HALT = 0.03        # halt new entries if day PnL <= -3% of start equity
 TRAIL_PERCENT = 2.5          # trailing-stop distance (%) — locks gains, cuts losers
 SENSITIVE_EXIT = False        # True = exit on fast (5m) flip; False = on blended flip
@@ -163,41 +140,8 @@ MIN_BUCKET_N = 100            # and this many trades in the bucket
 # Do not promote a good week here into a live deployment.
 #
 # NEVER set this True against a funded account.
-PLUMBING_TEST = False        # CUTOVER: real concurrent-Merton + vol-targeting is
-                             # now live (see ALLOCATOR block below). Fixed-fraction
-                             # plumbing is OFF. With gates intact this trades 0 until
-                             # a bucket clears MIN_BUCKET_T -- that is correct, not a
-                             # hang. Set True again only to exercise the order path.
+PLUMBING_TEST = True
 PLUMBING_FRACTION = 0.10      # fraction of equity per position when enabled
-
-# --- CONCURRENT ALLOCATOR + CONSTANT-VOLATILITY TARGETING -----------------
-# The live runner sizes the whole candidate book JOINTLY each bar (merton_alloc)
-# and then scales gross exposure to hold portfolio vol at VOL_TARGET_ANNUAL.
-#
-# READ THIS: vol targeting is a RISK controller, not a return generator. It holds
-# volatility constant; it does not change the SIGN of returns. On a signal with
-# mu<=0 it produces a constant-vol path with negative drift -- smoother losing,
-# not winning. It converts risk into RETURN only when the buckets feeding it have
-# a real (t>=MIN_BUCKET_T) positive edge. None currently do. So today this block
-# sizes every name to ZERO, exactly like the bare Merton sizer. It goes aggressive
-# automatically the moment slice_edge/reversion produce a qualifying bucket.
-VOL_TARGET_ANNUAL = 0.15     # AGGRESSION DIAL. Annualized portfolio vol target.
-                             # ~0.10 conservative | ~0.15 S&P-like | 0.25+ aggressive.
-                             # Higher = lever up harder in calm tapes (up to the cap).
-BOOK_CORRELATION = 0.40      # avg pairwise correlation assumed in the book-vol model
-                             # (large-cap intraday co-movement). Raise -> vol-target
-                             # treats the book as less diversified -> smaller gross.
-CONCENTRATION = 1.0          # 1.0 = pure proportional Merton allocation.
-                             # >1.0 tilts harder into the strongest-edge names
-                             # (explicit, non-theoretical override; leave at 1.0
-                             # unless you deliberately want winner-take-more).
-#
-# LEVERAGE: the vol-target's gross ceiling IS MAX_GROSS_EXPOSURE (above). It is
-# 1.0 = no leverage. To let the vol-targeter lever up, raise MAX_GROSS_EXPOSURE
-# ABOVE 1.0 (e.g. 2.0). That is the ONLY knob that lets this trade bigger than
-# unlevered -- and on zero-edge signal it amplifies variance, not return. Set it
-# with that understood; the RiskManager gross gate reads the same value, so they
-# stay consistent.
 
 # --- daily operation ------------------------------------------------------
 MARKET_TZ = "America/New_York"
