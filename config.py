@@ -116,20 +116,19 @@ MIN_SYMBOL_TRADES = 30        # min backtest trades to judge a symbol's own edge
 # means a symbol with 35 trades gets a much larger haircut than one with 300, and
 # a symbol whose edge is not credibly positive still sizes to zero.
 USE_PER_SYMBOL_STATS = True
-MIN_EDGE_RATIO = 0.0246       # worthiness bar: mu_lcb / sigma (return per unit risk).
-                              # CORRECTED from 0.2551. The old value came from a
-                              # bootstrap path that flipped NET returns, which
-                              # flips the cost term too and inflated the null
-                              # 95th percentile ~10x. Zero symbols cleared at
-                              # either value -- the absent edge is real, but the
-                              # threshold should still be the right one.
-                              # MEASURED, not guessed: this is the 95th percentile of
-                              # max(edge_ratio) under the date-blocked sign-flip null,
-                              # 2000 resamples, 50 symbols, run 2026-07-09.
-                              # The old value of 0.05 was 5x too lenient -- it admitted
-                              # TSLA at ratio=0.0721, which is BELOW the null median of
-                              # 0.1444 (family-wise p = 0.908).
-                              # Re-measure with: run_backtest.py --bootstrap 2000
+# FLOOR on the selection threshold -- no longer the threshold itself.
+#
+# The real bar is the empirical 95th percentile of max(edge_ratio) under the
+# date-blocked sign-flip null, and it MOVES with the number of symbols tested.
+# Since the universe is now derived from equity and market liquidity, N changes
+# between runs, so any constant here is wrong nearly all the time: calibrated at
+# 50 symbols it is anti-conservative at 800 and over-conservative at 20.
+#
+# run_backtest.py now measures the threshold every run at that run's actual N
+# and applies max(measured, this floor). The floor exists for two reasons: the
+# bootstrap cannot run when too few symbols have MIN_SYMBOL_TRADES, and an edge
+# below this is not worth the operational risk regardless of its significance.
+MIN_EDGE_RATIO = 0.0246
 DAILY_LOSS_HALT = 0.03        # halt new entries if day PnL <= -3% of start equity
 TRAIL_PERCENT = 2.5          # trailing-stop distance (%) — locks gains, cuts losers
 SENSITIVE_EXIT = False        # True = exit on fast (5m) flip; False = on blended flip
