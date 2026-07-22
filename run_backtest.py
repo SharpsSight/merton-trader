@@ -198,17 +198,15 @@ def main():
                 }
             else:
                 s_mu = s_sig = s_lcb = ratio = s_t = 0.0
-            worthy = bool(ratio >= config.MIN_EDGE_RATIO)
+            # `worthy` is deliberately NOT decided here. The threshold depends
+            # on how many symbols end up being tested, which is not known until
+            # this loop finishes -- see the bootstrap block below.
             per_symbol[sym] = {**m, "mu": float(s_mu), "sigma": float(s_sig),
                                "mu_lcb": float(s_lcb), "edge_ratio": float(ratio),
-                               "t_stat": float(s_t), "worthy": worthy}
-            if worthy:
-                tradeable.append(sym)
-
-            flag = "WORTH IT" if worthy else "skip (risk not justified)"
+                               "t_stat": float(s_t), "worthy": False}
             print(f"{sym:6s}: trades={m['n_trades']:4d} win={m['win_rate']:.2f} "
                   f"avg_ret={m['avg_ret']:+.4f} sigma={s_sig:.4f} t={s_t:+.2f} "
-                  f"ratio={ratio:+.3f}  {flag}")
+                  f"ratio={ratio:+.3f}")
         except Exception as e:
             print(f"{sym:6s}: error {e}")
 
@@ -227,6 +225,45 @@ def main():
 
     pooled = bt._bucket_stats(all_trades)   # pool across universe -- unbiased, see docstring
 
+    # ---- SELECTION THRESHOLD, MEASURED AT THIS RUN'S N ----------------------
+    # MIN_EDGE_RATIO is a threshold on the MAXIMUM of N correlated test
+    # statistics. The null distribution of that maximum shifts right as N grows,
+    # so a constant calibrated at 50 symbols is anti-conservative at 800 and
+    # over-conservative at 20. Since the universe is now derived from equity and
+    # market liquidity, N MOVES between runs -- which makes any hardcoded value
+    # wrong almost all the time.
+    #
+    # So measure it here, every run, against the N this run actually tested. The
+    # config constant survives only as a FLOOR for the case where the bootstrap
+    # cannot run (too few symbols with enough trades to resample).
+    n_tested = len(trades_by_symbol)
+    edge_threshold = float(config.MIN_EDGE_RATIO)
+    threshold_source = "config_fallback"
+    null = np.array([])
+
+    if args.bootstrap and trades_by_symbol:
+        print(f"\nBootstrapping the selection threshold: {args.bootstrap} "
+              f"date-blocked sign-flip resamples over {n_tested} symbols...")
+        null = bootstrap_max_ratio(trades_by_symbol, args.bootstrap)
+        if len(null):
+            q = float(np.quantile(null, 1 - config.SELECTION_ALPHA))
+            # Never go BELOW the configured floor. The bootstrap corrects for
+            # selection across symbols; it does not license trading an edge the
+            # operator has independently decided is too small to bother with.
+            edge_threshold = max(q, float(config.MIN_EDGE_RATIO))
+            threshold_source = ("bootstrap" if q >= config.MIN_EDGE_RATIO
+                                else "config_floor")
+
+    # apply it
+    tradeable = []
+    for sym, rec in per_symbol.items():
+        rec["worthy"] = bool(rec["edge_ratio"] >= edge_threshold)
+        if rec["worthy"]:
+            tradeable.append(sym)
+    print(f"\nSelection threshold: {edge_threshold:+.4f} ({threshold_source}, "
+          f"N={n_tested}, alpha={config.SELECTION_ALPHA}) -> "
+          f"{len(tradeable)} tradeable")
+
     # The live loop polls the WHOLE scan pool. Thinning is the job of the
     # entry threshold, the fundamental conjunction, the per-symbol `tradeable`
     # screen and the Merton gates -- in that order. Pre-truncating the universe
@@ -236,6 +273,15 @@ def main():
         "days": args.days,
         "universe": universe,
         "tradeable": tradeable,
+        "selection": {
+            "edge_threshold": edge_threshold,
+            "source": threshold_source,
+            "n_tested": n_tested,
+            "alpha": config.SELECTION_ALPHA,
+            "bootstrap_iters": int(args.bootstrap or 0),
+            "null_median": (float(np.median(null)) if len(null) else None),
+            "config_floor": float(config.MIN_EDGE_RATIO),
+        },
         "n_trades": len(all_trades),
         "buckets": pooled,
         "per_symbol": per_symbol,
@@ -244,13 +290,8 @@ def main():
         json.dump(payload, f, indent=2, default=float)
 
     print(f"Wrote {config.SIGNAL_STATS_PATH}  ({len(all_trades)} pooled trades, "
-          f"{len(tradeable)}/{len(universe)} of the SCAN pool clear the "
-          f"risk-adjusted bar (ratio >= {config.MIN_EDGE_RATIO}))")
-    print(f"\n!! MIN_EDGE_RATIO={config.MIN_EDGE_RATIO} was calibrated at 50 "
-          f"symbols. You are now screening {len(universe)}. The null "
-          f"distribution of max(edge_ratio) shifts RIGHT with the number of "
-          f"tests, so this threshold is now ANTI-CONSERVATIVE. Re-run with "
-          f"--bootstrap 2000 and reset it before trusting `tradeable`.")
+          f"{len(tradeable)}/{len(universe)} clear the measured bar "
+          f"(ratio >= {edge_threshold:+.4f}, {threshold_source}))")
     print(f"Tradeable: {', '.join(tradeable) or '(none)'}")
 
     cost_rt = 2 * (config.SLIPPAGE_BPS + config.SPREAD_BPS) / 1e4
@@ -272,12 +313,10 @@ def main():
               f"se={se*1e4:5.2f}bp t={t:+6.2f} mu_lcb={lcb:+.5f} "
               f"gross={gross:+.4f}  {flag}")
 
-    # ---- selection-adjusted null -------------------------------------------
-    if args.bootstrap and trades_by_symbol:
-        print(f"\n=== Selection-adjusted null for max(edge_ratio) "
-              f"({args.bootstrap} date-blocked sign-flip resamples) ===")
-        null = bootstrap_max_ratio(trades_by_symbol, args.bootstrap)
-        if len(null):
+    # ---- selection-adjusted null (already computed above) ------------------
+    if len(null):
+            print(f"\n=== Selection-adjusted null for max(edge_ratio) "
+                  f"({args.bootstrap} date-blocked sign-flip resamples) ===")
             obs = max((per_symbol[s]["edge_ratio"] for s in trades_by_symbol), default=0.0)
             q = float(np.quantile(null, 1 - config.SELECTION_ALPHA))
             pval = float((null >= obs).mean())
@@ -285,14 +324,16 @@ def main():
             print(f"  observed max(edge_ratio): {obs:+.4f}")
             print(f"  null median             : {np.median(null):+.4f}")
             print(f"  null {100*(1-config.SELECTION_ALPHA):.0f}th pct (the honest bar)"
-                  f": {q:+.4f}   [MIN_EDGE_RATIO is currently {config.MIN_EDGE_RATIO}]")
+                  f": {q:+.4f}   [APPLIED: {edge_threshold:+.4f} "
+                  f"via {threshold_source}]")
             print(f"  family-wise p-value     : {pval:.4f}")
             if obs < q:
                 print("  VERDICT: the best symbol is INSIDE the noise band. "
                       "No symbol has demonstrated edge. Do not trade this.")
             else:
                 print("  VERDICT: the best symbol survives the multiplicity "
-                      "correction. Set MIN_EDGE_RATIO to the quantile above.")
+                      "correction at this N. The threshold above was applied "
+                      "automatically; nothing to edit.")
 
     # --- exit-rule comparison on the tradeable set (signals built once) -------
     sfs = {}
@@ -333,8 +374,8 @@ def main():
         return
 
     print("\n=== Exit-rule comparison (tradeable set) ===")
-    print("NOTE: this is an in-sample comparison on the ONE symbol that won a "
-          "50-way search.\n      Treat differences under ~1 se as noise.")
+    print(f"NOTE: in-sample comparison on symbols that won an {n_tested}-way "
+          f"search.\n      Treat differences under ~1 se as noise.")
     print(f"{'variant':22s} {'trades':>6s} {'total':>8s} {'risk-adj':>9s} "
           f"{'win':>5s} {'worstday':>9s} {'down-days':>9s}")
     results = {}
