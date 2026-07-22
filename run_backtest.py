@@ -58,6 +58,7 @@ import pandas as pd
 import config
 import backtest as bt
 import data_feed as feed
+import fundamentals
 
 
 def _key(*names):
@@ -133,10 +134,22 @@ def main():
     tc = TradingClient(api_key, secret, paper=True)  # asset list for dynamic universe
 
     if config.USE_DYNAMIC_UNIVERSE:
-        # Rule-based candidate set (NYSE/NASDAQ common stock, ETFs excluded),
-        # ranked by dollar volume. eval_days=0 -> rank on recent liquidity so the
-        # written universe reflects what live can actually trade tomorrow.
-        universe = feed.dynamic_universe(dc, tc, config.UNIVERSE_SIZE)
+        # Rule-based candidate set ranked by dollar volume, intersected with the
+        # fundamentally-eligible set so the backtest measures the SAME universe
+        # the runner trades. Without this the stats are estimated on a population
+        # including ETFs that live can no longer enter -- the sizer would then be
+        # consuming mu/sigma from a different universe than it allocates over.
+        allowed = None
+        if config.USE_FUNDAMENTAL_GATE:
+            allowed = fundamentals.eligible(fundamentals.load())
+            if not allowed:
+                print("WARNING: no fundamentals cache -- backtesting the "
+                      "unfiltered universe. Stats will include ETFs the live "
+                      "runner will refuse to trade. Run the live process once "
+                      "while the market is closed to populate the cache.")
+                allowed = None
+        universe = feed.dynamic_universe(dc, tc, config.UNIVERSE_SIZE,
+                                         allowed=allowed)
     else:
         universe = feed.select_universe(dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE)
     if not universe:
