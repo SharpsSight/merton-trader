@@ -142,3 +142,58 @@ def vol_target_scale(allocations, symbol_vols, *, vol_target_annual,
         k = leverage_cap / base_gross
     gross_after = base_gross * k
     return k, sigma_p, sigma_p * k, gross_after
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MINIMUM-NOTIONAL TRUNCATION
+#
+# Spreading a fixed gross budget across too many names drives every position
+# below the size at which it is worth paying a round trip. The naive outcome is
+# not "slightly small positions" -- it is ZERO funded positions, because every
+# weight fails the floor at once. That failure is silent and indistinguishable
+# from a broken signal path.
+#
+# The book can support at most
+#       K = floor(gross_target * equity / min_notional)
+# positions. So rather than starve everyone equally, keep the K strongest
+# allocations and redistribute the whole budget across them. Ranking is by the
+# allocator's own desired weight, which is monotone in mu_lcb/sigma^2 -- so what
+# gets dropped is the weakest edge, not whatever happened to sort last.
+# ─────────────────────────────────────────────────────────────────────────────
+def enforce_min_notional(allocations, equity, *, min_notional,
+                         gross_target=None, max_fraction=None):
+    """Truncate to the strongest K allocations and re-spread the budget."""
+    gross_target = config.MAX_GROSS_EXPOSURE if gross_target is None else gross_target
+    max_fraction = config.MAX_FRACTION if max_fraction is None else max_fraction
+
+    live = [a for a in allocations if a.get("fraction", 0) > 0 and a.get("price", 0) > 0]
+    if not live or equity <= 0 or min_notional <= 0:
+        return allocations
+
+    k_max = int((gross_target * equity) // min_notional)
+    if k_max < 1:
+        for a in allocations:                    # budget cannot fund one position
+            a["fraction"], a["shares"] = 0.0, 0
+            a["gate"] = "below_min_notional"
+        return allocations
+
+    live.sort(key=lambda a: -a["fraction"])
+    keep, drop = live[:k_max], live[k_max:]
+
+    total = sum(a["fraction"] for a in keep)
+    scale = (gross_target / total) if total > 0 else 0.0
+    # only ever scale UP to fill a budget that truncation freed; never inflate
+    # past what the gated Merton weights actually asked for in aggregate
+    scale = min(scale, 1.0) if total >= gross_target else scale
+
+    for a in keep:
+        w = min(a["fraction"] * scale, max_fraction)
+        shares = int((w * equity) // a["price"])
+        if shares * a["price"] < min_notional:
+            a["fraction"], a["shares"], a["gate"] = 0.0, 0, "below_min_notional"
+        else:
+            a["fraction"] = w
+            a["shares"] = shares * a["direction"]
+    for a in drop:
+        a["fraction"], a["shares"], a["gate"] = 0.0, 0, "truncated_min_notional"
+    return allocations
