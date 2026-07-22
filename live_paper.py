@@ -77,9 +77,16 @@ BASE_BAR_MIN = int(list(config.TIMEFRAME_WEIGHTS)[0].replace("min", ""))
 # stretches across weekends and holidays.
 MAX_HOLD_SEC = (config.MAX_HOLD_CALENDAR_DAYS * 86400
                 if getattr(config, "MAX_HOLD_CALENDAR_DAYS", 0) else 0)
-OPEN_POLL_SECONDS = 60
+# Cycle time at 500 symbols is ~58s of indicator compute (measured 117ms each)
+# plus the bars fetch, so a cycle runs several minutes and this sleep is a floor,
+# not a period. That is fine: at a five-day holding horizon the entry decision is
+# not time-critical, and the loop is now paced by work rather than by the timer.
+OPEN_POLL_SECONDS = 15
 CLOSED_POLL_CAP = 900
-FETCH_DAYS = 15               # trailing history per symbol for warmup
+# Trailing history per symbol for indicator warmup. Kept small deliberately:
+# this is multiplied by 500 symbols on every cycle, and the indicators only need
+# enough bars to warm up, not enough to measure edge (that is the backtest's job).
+FETCH_DAYS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +222,86 @@ _TRADE_FIELDS = ["ts_utc", "session_date", "symbol", "action", "direction",
                  "fraction", "symbol_vol", "conf_mult", "gate"]
 
 
+def edge_stats(sym: str, bucket: str, stats: dict, per_symbol: dict) -> tuple:
+    """(mu, sigma, n, source) for the sizer.
+
+    Prefers the symbol's OWN measured distribution over its pooled score bucket.
+    Pooled buckets hand every symbol in a band identical mu and sigma, which
+    makes the allocator blind to which of them actually has the stronger edge --
+    its ranking degenerates to inverse-volatility. Scanning 500 names is only
+    worth doing if sizing can tell them apart.
+
+    Falls back to the bucket whenever the symbol's own sample is too thin to
+    estimate (MIN_SYMBOL_TRADES), so a new or illiquid name is sized on the
+    pooled prior rather than on noise.
+    """
+    ps = (per_symbol or {}).get(sym) if config.USE_PER_SYMBOL_STATS else None
+    if ps:
+        n = int(ps.get("n_trades", 0))
+        sigma = float(ps.get("sigma", 0.0) or 0.0)
+        if n >= config.MIN_SYMBOL_TRADES and sigma > 0:
+            return float(ps.get("mu", 0.0)), sigma, n, "symbol"
+    b = (stats or {}).get(bucket, {"mu": 0.0, "sigma": 0.0, "n": 0})
+    return (float(b.get("mu", 0.0)), float(b.get("sigma", 0.0)),
+            int(b.get("n", 0)), "bucket")
+
+
+class CycleBudget:
+    """Sizes the sweep from MEASURED throughput instead of a hardcoded count.
+
+    The operational limit on universe breadth is how many symbols fit inside one
+    decision cycle, and that depends on machine speed, pandas version, bar
+    history depth and API latency -- none of which are knowable when a constant
+    is typed into a config file. So measure it.
+
+    An exponentially-weighted per-symbol cost is updated every cycle and the
+    admitted count is budget / cost. Symbols are dropped from the BOTTOM of the
+    dollar-volume ranking, so the cap removes the least liquid names first --
+    the ones whose cost model was weakest anyway.
+    """
+
+    # Conservative prior so the FIRST cycle is bounded. Without it a cold start
+    # would attempt the full hard cap before any timing existed, and a six-minute
+    # opening sweep is exactly when you least want one. Measurement overwrites
+    # this after one cycle.
+    PRIOR_SEC_PER_SYMBOL = 0.20
+
+    def __init__(self, budget_sec: float, hard_cap: int):
+        self.budget = float(budget_sec)
+        self.hard_cap = int(hard_cap)
+        self.per_symbol = self.PRIOR_SEC_PER_SYMBOL
+        self._measured = False
+        self._last_reported = None
+
+    def observe(self, elapsed_sec: float, n_symbols: int) -> None:
+        if n_symbols <= 0 or elapsed_sec <= 0:
+            return
+        sample = elapsed_sec / n_symbols
+        if not self._measured:          # first real timing replaces the prior
+            self.per_symbol, self._measured = sample, True
+        else:
+            self.per_symbol = 0.7 * self.per_symbol + 0.3 * sample
+
+    def capacity(self) -> int:
+        return max(1, min(self.hard_cap, int(self.budget / self.per_symbol)))
+
+    def apply(self, ranked_universe, log=None):
+        """Truncate a dollar-volume-ranked list to what fits the budget."""
+        cap = self.capacity()
+        if len(ranked_universe) <= cap:
+            self._last_reported = None
+            return ranked_universe
+        if log and self._last_reported != cap:
+            log.warning("CYCLE | %d symbols available but only %d fit the %.0fs "
+                        "budget at %.0fms/symbol -- dropping the %d least "
+                        "liquid. Raise CYCLE_TIME_BUDGET_SEC to widen.",
+                        len(ranked_universe), cap, self.budget,
+                        1000.0 * (self.per_symbol or 0),
+                        len(ranked_universe) - cap)
+            self._last_reported = cap
+        return ranked_universe[:cap]
+
+
 def current_gross(positions: dict) -> float:
     """Sum of |position value| across the book, in dollars."""
     return sum(abs(p["shares"] * p["price"]) for p in positions.values())
@@ -267,6 +354,7 @@ def load_stats_and_universe(dc):
         with open(config.SIGNAL_STATS_PATH) as f:
             payload = json.load(f)
         stats = payload.get("buckets", {})
+        per_symbol = payload.get("per_symbol", {}) or {}
         universe = payload.get("universe") or feed.select_universe(
             dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) or config.UNIVERSE
 
@@ -285,11 +373,12 @@ def load_stats_and_universe(dc):
                 log.warning("tradeable is EMPTY: no symbol cleared MIN_EDGE_RATIO=%s. "
                             "No entries will be taken. Held positions still exit.",
                             config.MIN_EDGE_RATIO)
-        return stats, universe, tradeable, payload.get("generated_at")
+        return (stats, universe, tradeable, payload.get("generated_at"),
+                per_symbol)
     except FileNotFoundError:
         universe = feed.select_universe(
             dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) or config.UNIVERSE
-        return None, universe, set(universe), None
+        return None, universe, set(universe), None, {}
 
 
 def stats_are_stale(generated_at, session_date) -> bool:
@@ -411,12 +500,14 @@ def run():
             time.sleep(wait)
 
     session_date = session_date_of(clock)
-    stats, universe, tradeable, generated_at = load_stats_and_universe(dc)
+    stats, universe, tradeable, generated_at, per_symbol = \
+        load_stats_and_universe(dc)
     mode = "TRADE" if stats else "OBSERVE"
     equity = float(acct.equity)
     rm = RiskManager(equity, session_date=session_date)
     breaker_cooldown = 0
     halt_announced = False
+    budget = CycleBudget(config.CYCLE_TIME_BUDGET_SEC, config.UNIVERSE_HARD_CAP)
     # Persisted: positions now live for days, so this must survive both
     # restarts and rollovers. Inherited positions with no record get their clock
     # started at first sighting, which is conservative -- it can only delay a
@@ -487,7 +578,7 @@ def run():
                                   "(keeping previous cache)", e)
 
                 if maybe_refresh_stats(clock, session_date, generated_at):
-                    stats, universe, tradeable, generated_at = \
+                    stats, universe, tradeable, generated_at, per_symbol = \
                         load_stats_and_universe(dc)
                     mode = "TRADE" if stats else "OBSERVE"
                     log.info("STATS | reloaded | mode=%s universe=%d tradeable=%d "
@@ -533,9 +624,14 @@ def run():
                 halt_announced = True
 
             # ---------- data ------------------------------------------------
-            frames = feed.fetch_bars_batch(dc, universe + [config.MARKET_PROXY],
+            # `universe` is the economically eligible pool (derived from equity
+            # and market liquidity, not a chosen count). `swept` is however much
+            # of it fits the measured cycle budget. Decide BEFORE the fetch so we
+            # do not pay to download bars we will not process.
+            swept = budget.apply(universe, log=log)
+            frames = feed.fetch_bars_batch(dc, swept + [config.MARKET_PROXY],
                                            FETCH_DAYS)
-            fresh, age = bars_are_fresh(frames, universe, now)
+            fresh, age = bars_are_fresh(frames, swept, now)
             if not fresh:
                 log.error("DATA STALE | newest bar is %.0fs old (cap %ds) -- "
                           "suppressing entries this cycle", age,
@@ -543,6 +639,7 @@ def run():
 
             protected = open_order_symbols(tc)
             candidates = []          # PASS 1 fills this; PASS 2 allocates it
+            sweep_t0 = time.perf_counter()
 
             # ---------- volatility circuit breaker (with hysteresis) --------
             breaker_now = False
@@ -573,7 +670,7 @@ def run():
             action, reason = (no.news_risk_action({}, True) if breaker
                               else (NORMAL, "clear"))
 
-            for sym in universe:
+            for sym in swept:
                 try:
                     df = frames.get(sym)
                     if df is None or len(df) < 60:
@@ -666,7 +763,8 @@ def run():
 
                     conf = fac.confirmation(df, sig["direction"])
                     bucket = _bucket(sig["score"])
-                    bstats = (stats or {}).get(bucket, {"mu": 0, "sigma": 0, "n": 0})
+                    e_mu, e_sig, e_n, e_src = edge_stats(sym, bucket, stats,
+                                                        per_symbol)
 
                     bar_ret = df["close"].pct_change().dropna()
                     symbol_vol = float(bar_ret.tail(100).std() * (config.HOLD_BARS ** 0.5))
@@ -679,9 +777,8 @@ def run():
                     candidates.append({
                         "symbol": sym, "direction": sig["direction"],
                         "price": price, "score": sig["score"], "bucket": bucket,
-                        "mu": float(bstats.get("mu", 0.0)),
-                        "sigma": float(bstats.get("sigma", 0.0)),
-                        "n": int(bstats.get("n", 0)),
+                        "mu": e_mu, "sigma": e_sig, "n": e_n,
+                        "stat_source": e_src,
                         "symbol_vol": symbol_vol,
                         "confirmation": combined_mult,
                         "conf_mult": conf["multiplier"],
@@ -691,6 +788,8 @@ def run():
 
                 except Exception as e:
                     log.warning("  %s error: %s", sym, e)
+
+            budget.observe(time.perf_counter() - sweep_t0, len(swept))
 
             # ---------- entries: PASS 2, joint allocation -------------------
             # merton_alloc.allocate_book sizes every qualifying candidate in ONE
@@ -716,6 +815,8 @@ def run():
                     allocs = []
 
                 by_sym = {c["symbol"]: c for c in candidates}
+                for a in allocs:                       # truncation needs price
+                    a["price"] = by_sym[a["symbol"]]["price"]
 
                 if config.PLUMBING_TEST:
                     # Plumbing mode bypasses the Merton EDGE gate (mu_lcb is not
@@ -743,8 +844,27 @@ def run():
                         sh = int((w * equity) // c["price"])
                         allocs.append({"symbol": c["symbol"], "direction": c["direction"],
                                        "fraction": w, "shares": sh * c["direction"],
+                                       "price": c["price"],
                                        "bucket_t": 0.0, "mu_lcb": 0.0,
                                        "gate": "PLUMBING_TEST"})
+
+                # Truncate to the strongest K the book can actually fund. Without
+                # this, a wide candidate set drives every weight under the floor
+                # and the book funds NOTHING -- a silent no-trade that looks
+                # exactly like a broken signal path.
+                room_frac = max(0.0, config.MAX_GROSS_EXPOSURE
+                                - current_gross(positions) / max(equity, 1.0))
+                allocs = alloc.enforce_min_notional(
+                    allocs, equity, min_notional=config.MIN_ENTRY_NOTIONAL,
+                    gross_target=room_frac)
+                n_trunc = sum(1 for a in allocs
+                              if a.get("gate") == "truncated_min_notional")
+                if n_trunc:
+                    log.info("ALLOC | %d candidates truncated: book can fund at "
+                             "most %d positions of $%.0f at %.0f%% gross",
+                             n_trunc,
+                             int(room_frac * equity // config.MIN_ENTRY_NOTIONAL),
+                             config.MIN_ENTRY_NOTIONAL, room_frac * 100)
 
                 placed = 0
                 for a in sorted(allocs, key=lambda r: -abs(r["fraction"])):
@@ -785,6 +905,10 @@ def run():
                              a["fraction"], c["symbol_vol"], c["score"],
                              "n/a" if c["fund_score"] is None
                              else f"{c['fund_score']:+.2f}", a["bucket_t"])
+                    if c.get("stat_source") == "bucket":
+                        log.debug("    %s sized on POOLED bucket stats "
+                                  "(own sample < %d trades)", sym,
+                                  config.MIN_SYMBOL_TRADES)
                     log_trade(ts_utc=now.isoformat(),
                               session_date=str(session_date), symbol=sym,
                               action="ENTER", direction=c["direction"],
