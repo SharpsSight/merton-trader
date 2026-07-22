@@ -18,7 +18,48 @@ CANDIDATE_POOL = [
     "TMO", "ABT", "DHR", "BMY", "AMGN", "GILD", "ISRG", "NOW", "INTU", "MU",
     "AMAT", "LRCX", "PYPL", "UBER", "ABNB", "PLTR", "COIN", "SHOP", "F", "GM",
 ]
-UNIVERSE_SIZE = 50            # trade the top N of the pool by dollar-volume
+# ---------------------------------------------------------------------------
+# UNIVERSE SIZE IS DERIVED, NOT CHOSEN.
+#
+# "Top 50" and "top 500" are both arbitrary. Membership should follow from two
+# real constraints, and the COUNT should be whatever those constraints admit on
+# a given day at a given account size:
+#
+#   1. ECONOMIC  -- can this name be entered and exited at the modelled cost?
+#                   That depends on the name's liquidity AND on how large you
+#                   are. It scales with equity.
+#   2. OPERATIONAL -- how many symbols fit inside one decision cycle? Measured
+#                   at runtime from actual indicator timings, not assumed.
+#
+# Neither is a preference. The universe expands in liquid regimes and as the
+# account grows, and contracts when either reverses.
+# ---------------------------------------------------------------------------
+
+# 1. ECONOMIC FILTER
+# Market impact scales with participation rate: position notional as a share of
+# the name's average daily dollar volume. Staying under ~1% keeps impact inside
+# the few-bps the cost model assumes; above that the model is fiction and every
+# mu estimated through it is contaminated.
+MAX_PARTICIPATION_OF_ADV = 0.01
+
+# Floor beneath which no participation rate saves you. This is about SPREAD, not
+# impact: a thin name quotes 30-50bps wide to everyone, however small your order.
+ABSOLUTE_MIN_ADV_USD = 5_000_000.0
+
+# 2. OPERATIONAL CAP
+# Wall-clock budget for one full sweep. The runner measures its own per-symbol
+# cost and admits as many symbols as fit. At a five-day holding horizon the entry
+# decision is not time-critical, so this can be generous -- it exists to keep
+# bar staleness bounded, not to chase speed.
+CYCLE_TIME_BUDGET_SEC = 240.0
+
+# Safety rail on memory and API payload only. NOT a selection choice: if this
+# ever binds, the log says so explicitly so it is never silently shaping the
+# universe.
+UNIVERSE_HARD_CAP = 3000
+
+# Retained for the fallback path when the broker asset list is unavailable.
+UNIVERSE_SIZE = 500
 # True  = rank the whole liquid market by dollar-volume (feed.dynamic_universe).
 # False = rank the fixed CANDIDATE_POOL (feed.select_universe).
 USE_DYNAMIC_UNIVERSE = True
@@ -59,8 +100,22 @@ PER_SYMBOL_CAP = 0.10         # max fraction of equity per symbol
 # round trip of fixed cost on an economically meaningless position. The
 # 2026-07-16 log shows a 1-share fill and 5-share exits, all paying 10bps round
 # trip for exposure that cannot move the book. Skip rather than shave.
-MIN_ENTRY_NOTIONAL = 500.0
+MIN_ENTRY_NOTIONAL = 2500.0
 MIN_SYMBOL_TRADES = 30        # min backtest trades to judge a symbol's own edge
+
+# Size on the symbol's OWN measured mu/sigma rather than its pooled score bucket.
+#
+# Pooled buckets give every symbol in the same |score| band identical mu and
+# sigma, so the allocator's ranking among them collapses to inverse-volatility
+# -- it cannot prefer a stronger edge because it cannot see one. Scanning 500
+# names only pays off if sizing can distinguish them.
+#
+# Selection bias is handled by SEPARATION OF CONCERNS: the family-wise-corrected
+# `tradeable` screen decides WHO may trade, and only then does per-symbol mu
+# decide HOW MUCH. Small samples shrink themselves -- mu_lcb = mu - z*sigma/sqrt(n)
+# means a symbol with 35 trades gets a much larger haircut than one with 300, and
+# a symbol whose edge is not credibly positive still sizes to zero.
+USE_PER_SYMBOL_STATS = True
 MIN_EDGE_RATIO = 0.0246       # worthiness bar: mu_lcb / sigma (return per unit risk).
                               # CORRECTED from 0.2551. The old value came from a
                               # bootstrap path that flipped NET returns, which
@@ -273,6 +328,25 @@ def _resolve_data_dir(path: str) -> str:
 
 
 DATA_DIR = _resolve_data_dir(_requested)
+
+
+def required_min_adv(equity: float) -> float:
+    """Liquidity floor implied by YOUR OWN size, in average daily dollar volume.
+
+    A $100k account taking 10% positions needs $10k of liquidity; at a 1%
+    participation cap that is $1M ADV, so the absolute spread floor binds. A $5M
+    account taking the same 10% needs $500k, so it needs $50M ADV and the
+    participation term binds instead.
+
+    The point is that the universe should CONTRACT as the account grows. A book
+    that outgrows its universe starts paying impact the cost model never
+    budgeted for, and the first symptom is realised slippage drifting past the
+    5bps/side assumption -- which is also the IBKR-upgrade trigger.
+    """
+    max_position = MAX_FRACTION * max(equity, 0.0)
+    impact_floor = (max_position / MAX_PARTICIPATION_OF_ADV
+                    if MAX_PARTICIPATION_OF_ADV > 0 else 0.0)
+    return max(ABSOLUTE_MIN_ADV_USD, impact_floor)
 SIGNAL_STATS_PATH = os.path.join(DATA_DIR, "signal_stats.json")  # backtest -> runner
 BACKTEST_TRADES_PATH = os.path.join(DATA_DIR, "backtest_trades.csv")
 LIVE_TRADES_PATH = os.path.join(DATA_DIR, "live_trades.csv")
