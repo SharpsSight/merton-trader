@@ -141,13 +141,25 @@ def select_universe(dc, pool, top_n, lookback_days=10) -> list:
     return [s for s, _ in ranked[:top_n]]
 
 
-def dynamic_universe(dc, tc, top_n, lookback_days=10, min_price=5.0):
+def dynamic_universe(dc, tc, top_n, lookback_days=10, min_price=5.0,
+                     allowed=None):
     """Rank the whole liquid US equity market by recent dollar-volume.
 
-    Uses the broker's asset list (active, tradable, fractionable common stock on
-    NYSE/NASDAQ) instead of a hand-maintained CANDIDATE_POOL, then ranks by
-    dollar-volume exactly like select_universe. Falls back to select_universe on
-    any failure so a broker hiccup can never leave the universe empty.
+    Falls back to select_universe on any failure so a broker hiccup can never
+    leave the universe empty.
+
+    `allowed`: optional set of symbols to intersect with. This is how ETFs get
+    excluded. The docstring here used to claim "common stock" but the filter
+    below only checks AssetClass.US_EQUITY, which in Alpaca INCLUDES ETFs -- the
+    2026-07-17 session held QQQ, SMH, SOXX and SPCX alongside AVGO, LRCX, KLAC,
+    MU, ASML, AMAT and MRVL. That is one semiconductor bet expressed eleven
+    times. It inflates the apparent position count while the number of
+    independent bets stays near three, which is precisely the correlation that
+    makes raw trade count a lie about sample size.
+
+    Alpaca exposes no reliable is_etf flag, so the real filter is upstream:
+    fundamentals.eligible() returns the symbols that have SEC XBRL facts, and an
+    ETF has none. Pass that set in as `allowed`.
 
     NOTE: a larger universe is more names, not more edge. The pooled backtest has
     shown zero gross edge whether the universe is 50 or 100 symbols; broadening
@@ -162,6 +174,12 @@ def dynamic_universe(dc, tc, top_n, lookback_days=10, min_price=5.0):
                 if a.tradable and getattr(a, "fractionable", False)
                 and a.exchange in (AssetExchange.NYSE, AssetExchange.NASDAQ)
                 and "." not in a.symbol and "/" not in a.symbol]
+        if allowed:
+            allowed_up = {x.upper() for x in allowed}
+            before = len(syms)
+            syms = [s_ for s_ in syms if s_.upper() in allowed_up]
+            print(f"dynamic_universe: fundamental-eligibility filter kept "
+                  f"{len(syms)}/{before} symbols")
         if not syms:
             raise ValueError("no tradable assets returned")
     except Exception as e:
