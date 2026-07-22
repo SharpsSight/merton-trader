@@ -148,10 +148,21 @@ def main():
                       "runner will refuse to trade. Run the live process once "
                       "while the market is closed to populate the cache.")
                 allowed = None
-        universe = feed.dynamic_universe(dc, tc, config.UNIVERSE_SIZE,
-                                         allowed=allowed)
+        # Liquidity floor derived from the live account, so the backtest
+        # measures the same population the runner can actually transact in.
+        try:
+            bt_equity = float(tc.get_account().equity)
+        except Exception:
+            bt_equity = 100_000.0
+        min_adv = config.required_min_adv(bt_equity)
+        print(f"Equity ${bt_equity:,.0f} -> min ADV ${min_adv:,.0f} "
+              f"(participation cap {config.MAX_PARTICIPATION_OF_ADV:.1%})")
+        universe = feed.dynamic_universe(
+            dc, tc, top_n=config.UNIVERSE_HARD_CAP, allowed=allowed,
+            min_adv=min_adv)
     else:
-        universe = feed.select_universe(dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE)
+        universe = feed.select_universe(dc, config.CANDIDATE_POOL,
+                                        config.UNIVERSE_SIZE)
     if not universe:
         print("Universe selection returned nothing; falling back."); universe = config.UNIVERSE
     print(f"Universe ({len(universe)} by dollar-volume): {', '.join(universe)}\n")
@@ -215,6 +226,11 @@ def main():
     print(f"\nWrote {config.BACKTEST_TRADES_PATH} ({len(all_trades)} trades)")
 
     pooled = bt._bucket_stats(all_trades)   # pool across universe -- unbiased, see docstring
+
+    # The live loop polls the WHOLE scan pool. Thinning is the job of the
+    # entry threshold, the fundamental conjunction, the per-symbol `tradeable`
+    # screen and the Merton gates -- in that order. Pre-truncating the universe
+    # here would discard candidates before any of those had an opinion.
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "days": args.days,
@@ -228,8 +244,13 @@ def main():
         json.dump(payload, f, indent=2, default=float)
 
     print(f"Wrote {config.SIGNAL_STATS_PATH}  ({len(all_trades)} pooled trades, "
-          f"{len(tradeable)}/{len(universe)} clear the risk-adjusted bar "
-          f"(ratio >= {config.MIN_EDGE_RATIO}))")
+          f"{len(tradeable)}/{len(universe)} of the SCAN pool clear the "
+          f"risk-adjusted bar (ratio >= {config.MIN_EDGE_RATIO}))")
+    print(f"\n!! MIN_EDGE_RATIO={config.MIN_EDGE_RATIO} was calibrated at 50 "
+          f"symbols. You are now screening {len(universe)}. The null "
+          f"distribution of max(edge_ratio) shifts RIGHT with the number of "
+          f"tests, so this threshold is now ANTI-CONSERVATIVE. Re-run with "
+          f"--bootstrap 2000 and reset it before trusting `tradeable`.")
     print(f"Tradeable: {', '.join(tradeable) or '(none)'}")
 
     cost_rt = 2 * (config.SLIPPAGE_BPS + config.SPREAD_BPS) / 1e4
