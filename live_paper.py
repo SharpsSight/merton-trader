@@ -369,10 +369,19 @@ def load_stats_and_universe(dc):
                         "%d universe symbols as eligible", len(universe))
         else:
             tradeable = set(t)
+            sel = payload.get("selection") or {}
+            if sel:
+                log.info("SELECTION | threshold %+.4f (%s) measured over N=%s "
+                         "symbols at alpha=%s | %d tradeable",
+                         sel.get("edge_threshold", float("nan")),
+                         sel.get("source", "?"), sel.get("n_tested", "?"),
+                         sel.get("alpha", "?"), len(tradeable))
             if not tradeable:
-                log.warning("tradeable is EMPTY: no symbol cleared MIN_EDGE_RATIO=%s. "
-                            "No entries will be taken. Held positions still exit.",
-                            config.MIN_EDGE_RATIO)
+                log.warning("tradeable is EMPTY: no symbol cleared the measured "
+                            "selection threshold %s (N=%s). No entries will be "
+                            "taken. Held positions still exit.",
+                            sel.get("edge_threshold", config.MIN_EDGE_RATIO),
+                            sel.get("n_tested", "?"))
         return (stats, universe, tradeable, payload.get("generated_at"),
                 per_symbol)
     except FileNotFoundError:
