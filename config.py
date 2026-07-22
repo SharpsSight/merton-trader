@@ -41,14 +41,33 @@ GAMMA = 3.0                   # CRRA risk aversion (higher = more conservative)
 FRACTIONAL = 0.25            # fractional-Kelly style haircut (variance control)
 LCB_Z = 1.0                  # z for lower-confidence-bound mu shrinkage
 MAX_FRACTION = 0.10          # max fraction of equity in one position
-HOLD_BARS = 24               # ~expected holding horizon (5m bars) for vol scaling
+# ~expected holding horizon in 5m bars, used ONLY to scale per-bar vol into
+# horizon vol for the sizer's risk denominator.
+# CHANGED: was 24 (2 hours). MUST track the real holding period -- symbol_vol is
+# per-bar sigma * sqrt(HOLD_BARS) and f* = mu_lcb/(gamma*symbol_vol^2), so
+# leaving this at 24 while positions run five sessions understates sigma ~4x and
+# therefore overstates the Merton fraction ~16x. 5 sessions * 78 RTH bars = 390.
+HOLD_BARS = 390
 
 # --- risk manager ---------------------------------------------------------
 MAX_GROSS_EXPOSURE = 1.0      # sum |position value| <= this * equity (no leverage)
 MAX_POSITIONS = None          # no count cap: worthiness + gross exposure decide breadth
 PER_SYMBOL_CAP = 0.10         # max fraction of equity per symbol
+
+# Floor on entry size, in dollars. When a risk cap shaves an allocation down to
+# a token stake, that is not a smaller version of the trade -- it is a full
+# round trip of fixed cost on an economically meaningless position. The
+# 2026-07-16 log shows a 1-share fill and 5-share exits, all paying 10bps round
+# trip for exposure that cannot move the book. Skip rather than shave.
+MIN_ENTRY_NOTIONAL = 500.0
 MIN_SYMBOL_TRADES = 30        # min backtest trades to judge a symbol's own edge
-MIN_EDGE_RATIO = 0.2551       # worthiness bar: mu_lcb / sigma (return per unit risk).
+MIN_EDGE_RATIO = 0.0246       # worthiness bar: mu_lcb / sigma (return per unit risk).
+                              # CORRECTED from 0.2551. The old value came from a
+                              # bootstrap path that flipped NET returns, which
+                              # flips the cost term too and inflated the null
+                              # 95th percentile ~10x. Zero symbols cleared at
+                              # either value -- the absent edge is real, but the
+                              # threshold should still be the right one.
                               # MEASURED, not guessed: this is the 95th percentile of
                               # max(edge_ratio) under the date-blocked sign-flip null,
                               # 2000 resamples, 50 symbols, run 2026-07-09.
@@ -91,20 +110,43 @@ HIGH_IMPACT_KEYWORDS = [
 ]
 
 # --- overnight handling ---------------------------------------------------
-FLATTEN_EOD = True            # True = close all positions before the close.
-                              # Every dollar the system has ever made came from
-                              # overnight gaps (Jul 8: 3 longs, +$958). Every
-                              # same-day round trip it opened AND closed lost
-                              # money (0 for 6, -$137). Turning this on removes
-                              # the gap exposure -- which means it also removes
-                              # the only source of P&L the system has shown.
-                              # That is the point: it isolates the signal.
+# CHANGED: was True (flatten every position before every close).
+#
+# Cost is FIXED per round trip; signal grows with sqrt(holding time). At 25%
+# annualised vol the noise over a 30-minute hold is ~44bps, so a 10bps round
+# trip demands a per-trade information ratio of 10/44 = 0.23 just to break even.
+# A genuinely good intraday signal runs 0.02-0.05. The system was short by 5-10x
+# and no amount of signal work closes that gap.
+#
+# Stretching the hold to ~5 sessions takes per-trade sigma to ~350bps against
+# the same 10bps cost -- required IR drops to ~0.03, which is inside the range a
+# real signal can actually reach. This single change buys more than any signal
+# improvement available, and it costs nothing.
+#
+# It also stops the pathology visible in the 2026-07-17 logs, where MAXHOLD
+# force-closed AMZN at score -0.87, STX at +0.71 and JNJ at +0.60 -- paying the
+# exit cost on precisely the positions the signal liked most.
+FLATTEN_EOD = False
 FLATTEN_BUFFER_MIN = 10       # minutes before the close to flatten when FLATTEN_EOD
 
-# Maximum bars to hold a position before exiting at the next open, regardless of
-# signal. 24 five-minute bars = 2 hours. Caps the tail of the holding-time
-# distribution so mu/sigma are estimated over a horizon the runner can honour.
-MAX_HOLD_BARS = 24
+# Legacy intraday cap on the LIVE path. 0 = disabled; the calendar cap governs.
+MAX_HOLD_BARS = 0
+
+# The backtest indexes bars, not wall clock, so it needs the SAME cap expressed
+# in base bars or it measures a different strategy than the runner executes.
+# With RTH_ONLY the base frame is 78 five-minute bars per session, so 5 sessions
+# = 390. This MUST stay consistent with MAX_HOLD_CALENDAR_DAYS: a backtest whose
+# holding-time distribution differs from live produces mu/sigma for a strategy
+# that does not exist, and MIN_BUCKET_T then gates on the wrong distribution.
+MAX_HOLD_BARS_BACKTEST = 390
+
+# Maximum WALL-CLOCK days to hold before a forced exit. 7 calendar days is about
+# 5 trading sessions. Calendar days rather than a bar count because the position
+# now survives session boundaries, and a bar counter that only advances during
+# RTH silently stretches over weekends and holidays.
+MAX_HOLD_CALENDAR_DAYS = 7
+
+
 
 # --- selection-bias control ----------------------------------------------
 # MIN_EDGE_RATIO is a THRESHOLD ON THE MAXIMUM OF 50 CORRELATED TEST STATISTICS.
@@ -156,9 +198,39 @@ PLUMBING_FRACTION_MIN = 0.03  # MIN fraction, at |score|=ENTRY_THRESHOLD (margin
                               # the Merton sizer (PLUMBING_TEST=False), which sizes
                               # zero here because mu_lcb <= 0.
 
+# --- fundamental screen (SEC EDGAR) ---------------------------------------
+# Fundamentals are a SCREEN and a SIZE MULTIPLIER, never a direction generator.
+# Financials update quarterly, so at a daily decision cadence they contribute
+# zero daily variation -- they cannot be a signal, only a filter. Direction
+# stays with the trend layer.
+#
+# The value of the screen is ORTHOGONALITY. Every existing input (ADX, RSI,
+# Bollinger, MFI, Supertrend) is a transform of the same OHLCV series, so their
+# "agreement" is one piece of evidence counted several times. Accounting data is
+# a different measurement of a different thing on a different clock, so a
+# price/fundamental conjunction is a real conjunction.
+USE_FUNDAMENTAL_GATE = True
+FUND_REFRESH_DAYS = 7         # refresh cadence; quarterly data, weekly is ample
+FUND_MIN_FAMILIES = 3         # of {value, quality, safety, growth} required
+FUND_MIN_CROSS_SECTION = 8    # fewer names than this -> no z-scores at all
+
+# CONJUNCTION thresholds, not a blend. A weighted average lets a loud technical
+# score override a bad balance sheet, which defeats the entire purpose: the
+# point is to require BOTH, so only agreement between two independent sources
+# opens a position.
+FUND_LONG_MIN = 0.0           # long requires composite score > this
+FUND_SHORT_MAX = 0.0          # short requires composite score < this
+FUND_REQUIRE_SCORE = True     # unscored symbol (ETF/trust/ADR) -> no entry
+FUND_MULT_FLOOR = 0.5         # weakest fundamental agreement still sizes at 50%
+
 # --- daily operation ------------------------------------------------------
 MARKET_TZ = "America/New_York"
-BACKTEST_DAYS = 60            # --days passed to the nightly stats refresh
+# CHANGED: was 60. Holding period went from ~24 bars to ~390, so 60 days of
+# history yields roughly 12 non-overlapping holding windows per symbol instead
+# of ~195. Bucket n collapses below MIN_BUCKET_N=100 and every bucket sizes to
+# zero for want of sample, not for want of edge. Longer holds REQUIRE a longer
+# window to estimate the same distribution to the same precision.
+BACKTEST_DAYS = 400
 STATS_REFRESH_START_ET = "08:00"   # nightly refresh window (pre-open)
 STATS_REFRESH_END_ET = "09:20"
 MAX_BAR_STALENESS_SEC = 900   # during RTH, no fresh bar in this long -> no entries
@@ -204,3 +276,8 @@ DATA_DIR = _resolve_data_dir(_requested)
 SIGNAL_STATS_PATH = os.path.join(DATA_DIR, "signal_stats.json")  # backtest -> runner
 BACKTEST_TRADES_PATH = os.path.join(DATA_DIR, "backtest_trades.csv")
 LIVE_TRADES_PATH = os.path.join(DATA_DIR, "live_trades.csv")
+FUND_CACHE_PATH = os.path.join(DATA_DIR, "fundamentals.json")
+# Entry timestamps must now survive both restarts and session rollovers: with
+# FLATTEN_EOD off a position lives for days, and an in-memory dict silently
+# resets its max-hold clock every night (and on every redeploy).
+ENTRY_TIMES_PATH = os.path.join(DATA_DIR, "entry_times.json")
