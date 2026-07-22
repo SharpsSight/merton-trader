@@ -141,12 +141,16 @@ def select_universe(dc, pool, top_n, lookback_days=10) -> list:
     return [s for s, _ in ranked[:top_n]]
 
 
-def dynamic_universe(dc, tc, top_n, lookback_days=10, min_price=5.0,
-                     allowed=None):
+def dynamic_universe(dc, tc, top_n=None, lookback_days=10, min_price=5.0,
+                     allowed=None, min_adv=None, require_shortable=False):
     """Rank the whole liquid US equity market by recent dollar-volume.
 
     Falls back to select_universe on any failure so a broker hiccup can never
     leave the universe empty.
+
+    `top_n=None` returns EVERY symbol that clears the economic filters, so the
+    count is an output of market conditions and account size rather than a
+    chosen constant. Pass an integer only to impose a hard operational cap.
 
     `allowed`: optional set of symbols to intersect with. This is how ETFs get
     excluded. The docstring here used to claim "common stock" but the filter
@@ -173,7 +177,10 @@ def dynamic_universe(dc, tc, top_n, lookback_days=10, min_price=5.0,
         syms = [a.symbol for a in assets
                 if a.tradable and getattr(a, "fractionable", False)
                 and a.exchange in (AssetExchange.NYSE, AssetExchange.NASDAQ)
-                and "." not in a.symbol and "/" not in a.symbol]
+                and "." not in a.symbol and "/" not in a.symbol
+                and (not require_shortable
+                     or (getattr(a, "shortable", False)
+                         and getattr(a, "easy_to_borrow", False)))]
         if allowed:
             allowed_up = {x.upper() for x in allowed}
             before = len(syms)
@@ -200,10 +207,24 @@ def dynamic_universe(dc, tc, top_n, lookback_days=10, min_price=5.0,
             px = float(df["close"].iloc[-1])
             if px < min_price:
                 continue
-            ranked.append((sym, float((df["close"] * df["volume"]).mean())))
+            adv = float((df["close"] * df["volume"]).mean())
+            # Liquidity floor. A name below this cannot be entered or exited at
+            # the modelled 5bps+2bps, so including it does not widen the
+            # opportunity set -- it just injects trades whose true cost is
+            # unknown into the same mu/sigma the sizer consumes.
+            if min_adv and adv < min_adv:
+                continue
+            ranked.append((sym, adv))
     ranked.sort(key=lambda x: x[1], reverse=True)
-    out = [s for s, _ in ranked[:top_n]]
+    # No ordinal cutoff by default: everything that clears the filters is in.
+    out = [s for s, _ in (ranked[:top_n] if top_n else ranked)]
+    print(f"dynamic_universe: {len(out)} symbols clear "
+          f"price>=${min_price:.0f}"
+          + (f", ADV>=${min_adv:,.0f}" if min_adv else "")
+          + (", shortable" if require_shortable else "")
+          + (f" (capped at {top_n})" if top_n and len(ranked) > top_n else ""))
     if not out:
         import config
-        return select_universe(dc, config.CANDIDATE_POOL, top_n, lookback_days)
+        return select_universe(dc, config.CANDIDATE_POOL,
+                               config.UNIVERSE_SIZE, lookback_days)
     return out
