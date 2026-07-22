@@ -51,6 +51,8 @@ except ImportError:
 import config
 import trend_signals as ts
 import factors as fac
+import fundamentals as fund
+import merton_alloc as alloc
 import merton
 import news_overlay as no
 import data_feed as feed
@@ -70,7 +72,11 @@ log = logging.getLogger("runner")
 
 ET = ZoneInfo(config.MARKET_TZ)
 BASE_BAR_MIN = int(list(config.TIMEFRAME_WEIGHTS)[0].replace("min", ""))
-MAX_HOLD_SEC = config.MAX_HOLD_BARS * BASE_BAR_MIN * 60 if config.MAX_HOLD_BARS else 0
+# Wall-clock, not a bar count. With FLATTEN_EOD off a position now survives
+# session boundaries, and a counter that only advances during RTH silently
+# stretches across weekends and holidays.
+MAX_HOLD_SEC = (config.MAX_HOLD_CALENDAR_DAYS * 86400
+                if getattr(config, "MAX_HOLD_CALENDAR_DAYS", 0) else 0)
 OPEN_POLL_SECONDS = 60
 CLOSED_POLL_CAP = 900
 FETCH_DAYS = 15               # trailing history per symbol for warmup
@@ -207,6 +213,34 @@ def open_order_symbols(tc):
 _TRADE_FIELDS = ["ts_utc", "session_date", "symbol", "action", "direction",
                  "shares", "price", "score", "bucket", "mu_lcb", "bucket_t",
                  "fraction", "symbol_vol", "conf_mult", "gate"]
+
+
+def current_gross(positions: dict) -> float:
+    """Sum of |position value| across the book, in dollars."""
+    return sum(abs(p["shares"] * p["price"]) for p in positions.values())
+
+
+def load_entry_times() -> dict:
+    """Entry timestamps survive restarts AND session rollovers.
+
+    With multi-day holds an in-memory dict is wrong twice over: a redeploy
+    resets every position's max-hold clock to zero, and so does every nightly
+    rollover. Both silently let a position run past its cap.
+    """
+    try:
+        with open(config.ENTRY_TIMES_PATH) as f:
+            raw = json.load(f)
+        return {k: datetime.fromisoformat(v) for k, v in raw.items()}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_entry_times(entry_times: dict) -> None:
+    try:
+        with open(config.ENTRY_TIMES_PATH, "w") as f:
+            json.dump({k: v.isoformat() for k, v in entry_times.items()}, f)
+    except OSError as e:
+        log.warning("entry-times write failed: %s", e)
 
 
 def log_trade(**row):
@@ -355,13 +389,26 @@ def run():
     if not api_key or not secret:
         log.error("Credentials not found."); sys.exit(1)
 
-    try:
-        tc = TradingClient(api_key, secret, paper=True)
-        dc = StockHistoricalDataClient(api_key, secret)
-        clock = tc.get_clock()
-        acct = tc.get_account()
-    except Exception as e:
-        log.error("Auth failed (paper keys?): %s", e); sys.exit(1)
+    # Retry rather than sys.exit. On 2026-07-18 at 04:16 UTC the container lost
+    # DNS ("Temporary failure in name resolution" on paper-api.alpaca.markets)
+    # and never logged again. A transient network fault at boot must not be a
+    # terminal condition -- a process that exits here is a process that only
+    # comes back if the platform restarts it.
+    tc = dc = clock = acct = None
+    attempt = 0
+    while True:
+        try:
+            tc = TradingClient(api_key, secret, paper=True)
+            dc = StockHistoricalDataClient(api_key, secret)
+            clock = tc.get_clock()
+            acct = tc.get_account()
+            break
+        except Exception as e:
+            attempt += 1
+            wait = min(300, 15 * attempt)
+            log.error("Startup connect failed (attempt %d): %s -- retrying in %ds",
+                      attempt, e, wait)
+            time.sleep(wait)
 
     session_date = session_date_of(clock)
     stats, universe, tradeable, generated_at = load_stats_and_universe(dc)
@@ -369,11 +416,13 @@ def run():
     equity = float(acct.equity)
     rm = RiskManager(equity, session_date=session_date)
     breaker_cooldown = 0
-    # in-memory only. With FLATTEN_EOD the book never survives a session, so a
-    # process restart cannot orphan an entry time for long. Inherited positions
-    # get their clock started at first sighting, which is conservative: it can
-    # only delay a max-hold exit, never trigger one early.
-    entry_times = {}
+    halt_announced = False
+    # Persisted: positions now live for days, so this must survive both
+    # restarts and rollovers. Inherited positions with no record get their clock
+    # started at first sighting, which is conservative -- it can only delay a
+    # max-hold exit, never trigger one early.
+    entry_times = load_entry_times()
+    fundamentals = fund.load()
 
     log.info("=== live_paper starting | mode=%s | equity $%s | universe=%d "
              "| tradeable=%d | session=%s | stats_generated=%s ===",
@@ -411,11 +460,32 @@ def run():
                 equity = float(acct.equity)
                 rm.new_session(equity, session_date)    # start_equity + halt latch
                 breaker_cooldown = 0
-                entry_times.clear()
+                halt_announced = False
+                # entry_times deliberately NOT cleared: a position that survives
+                # the rollover must keep its original max-hold clock.
                 reconcile(tc, current_positions(tc), session_date)
 
             # ---------- market closed --------------------------------------
             if not clock.is_open:
+                # Weekly, while the market is shut: ~50-100 sequential SEC calls
+                # is minutes of wall time and must never run inside a trading
+                # cycle. Quarterly data at a weekly refresh has no staleness cost.
+                if config.USE_FUNDAMENTAL_GATE and fund.is_stale(fundamentals):
+                    try:
+                        px = {}
+                        try:
+                            fr = feed.fetch_bars_batch(dc, universe, 5)
+                            px = {k: float(v["close"].iloc[-1])
+                                  for k, v in fr.items()
+                                  if v is not None and len(v)}
+                        except Exception as e:
+                            log.warning("FUNDAMENTALS | price fetch failed: %s", e)
+                        pool = sorted(set(universe) | set(config.CANDIDATE_POOL))
+                        fundamentals = fund.refresh(pool, px, log=log)
+                    except Exception as e:
+                        log.error("FUNDAMENTALS | refresh failed: %s "
+                                  "(keeping previous cache)", e)
+
                 if maybe_refresh_stats(clock, session_date, generated_at):
                     stats, universe, tradeable, generated_at = \
                         load_stats_and_universe(dc)
@@ -444,9 +514,23 @@ def run():
                     for s in list(positions.keys()):
                         close_position_safely(tc, s)
                     entry_times.clear()
+                    save_entry_times(entry_times)
                     log.info("EOD FLATTEN | closed %d positions | %.0f min to close",
                              len(positions), secs_to_close / 60)
                     time.sleep(OPEN_POLL_SECONDS); continue
+
+            # ---------- halt short-circuit ----------------------------------
+            # The halt latches for the session, so once it trips there is no
+            # point computing entry signals at all. On 2026-07-17 the runner
+            # logged ~25 "blocked: daily_loss_halt" lines every 70 seconds for
+            # five hours -- full indicator work on every symbol, discarded at the
+            # final gate. Exits and stops still run below; only entries stop.
+            entries_halted = rm.daily_halt(equity)
+            if entries_halted and not halt_announced:
+                log.warning("HALT | daily loss halt latched for %s -- entries "
+                            "suppressed for the session. Exits still active.",
+                            session_date)
+                halt_announced = True
 
             # ---------- data ------------------------------------------------
             frames = feed.fetch_bars_batch(dc, universe + [config.MARKET_PROXY],
@@ -458,6 +542,7 @@ def run():
                           config.MAX_BAR_STALENESS_SEC)
 
             protected = open_order_symbols(tc)
+            candidates = []          # PASS 1 fills this; PASS 2 allocates it
 
             # ---------- volatility circuit breaker (with hysteresis) --------
             breaker_now = False
@@ -513,6 +598,7 @@ def run():
                                   bucket=_bucket(sig["score"]), gate="exit")
                         positions.pop(sym, None)
                         entry_times.pop(sym, None)
+                        save_entry_times(entry_times)
                         if plan == "EXIT":
                             continue
                         held_dir = 0                    # FLIP falls through to enter
@@ -537,6 +623,7 @@ def run():
                                               bucket=_bucket(sig["score"]), gate="max_hold")
                                     positions.pop(sym, None)
                                     entry_times.pop(sym, None)
+                                    save_entry_times(entry_times)
                                 continue
                         if held != 0 and sym not in protected:
                             place_trailing_stop(tc, sym, abs(held), held > 0)
@@ -544,13 +631,38 @@ def run():
                                      sym, held)
                         continue
 
-                    # --- entries ---------------------------------------------
+                    # --- entries: PASS 1, collect candidates -----------------
+                    # Do NOT place the order here. Sizing every symbol against
+                    # the gross cap in universe order is first-come-first-served:
+                    # names early in the loop take 3-12% of equity each, the cap
+                    # is exhausted after ~10-15 fills, and every symbol evaluated
+                    # afterwards gets int(room_gross // price) = 1 share, then 0.
+                    # Alphabetical position silently decides the book, and the
+                    # tail of it is one-share noise paying full round-trip cost.
+                    # Collect first, allocate jointly below.
                     if sig["direction"] == 0:
                         continue
+                    if entries_halted:
+                        continue        # latched for the session; see above
                     if sym not in tradeable and not config.PLUMBING_TEST:
                         continue
                     if not fresh:
                         continue                        # no entries on stale data
+
+                    # --- FUNDAMENTAL CONJUNCTION -----------------------------
+                    # Hard gate, applied BEFORE sizing. The trend layer has
+                    # already chosen a direction; this asks whether an
+                    # independent, non-price measurement agrees with it. Note
+                    # this also runs under PLUMBING_TEST: plumbing mode bypasses
+                    # the Merton EDGE gate, but it must not bypass the universe
+                    # composition rule, or ETFs walk straight back in.
+                    fscore = fund.score_for(fundamentals, sym)
+                    fgate = fac.fundamental_confirmation(fscore, sig["direction"])
+                    if not fgate["allow"]:
+                        log.debug("  [fund] %-5s blocked: %s (score=%s)",
+                                  sym, fgate["reason"],
+                                  "None" if fscore is None else f"{fscore:+.3f}")
+                        continue
 
                     conf = fac.confirmation(df, sig["direction"])
                     bucket = _bucket(sig["score"])
@@ -559,66 +671,136 @@ def run():
                     bar_ret = df["close"].pct_change().dropna()
                     symbol_vol = float(bar_ret.tail(100).std() * (config.HOLD_BARS ** 0.5))
 
-                    intent = merton.size_position(equity, price, sig["direction"],
-                                                  bstats, symbol_vol, conf["multiplier"])
+                    # Both confirmation layers multiply into size. Each can only
+                    # SHRINK the position (both bounded <= 1.0) -- factors reduce
+                    # risk, they never manufacture conviction.
+                    combined_mult = conf["multiplier"] * fgate["multiplier"]
 
-                    if config.PLUMBING_TEST and intent["shares"] == 0:
-                        # Fixed-size override. Merton said zero (no positive edge);
-                        # we place an order anyway to exercise the order path.
-                        #
-                        # CONFIDENCE-WEIGHTED sizing (still NOT edge-based -- the
-                        # weight is the signal's own |score|, not mu, because mu is
-                        # not positive). A |score|=0.9 conviction gets a bigger
-                        # slice than a |score|=0.35 marginal one, and the fraction
-                        # rebalances as the score moves. Interpolates linearly from
-                        # PLUMBING_FRACTION_MIN at ENTRY_THRESHOLD to
-                        # PLUMBING_FRACTION at |score|=1.0.
-                        lo = config.ENTRY_THRESHOLD
-                        conviction = (abs(sig["score"]) - lo) / max(1e-9, 1.0 - lo)
-                        conviction = min(1.0, max(0.0, conviction))
-                        frac = (config.PLUMBING_FRACTION_MIN
-                                + conviction * (config.PLUMBING_FRACTION
-                                                - config.PLUMBING_FRACTION_MIN))
-                        # factor-confirmation multiplier tilts it a little more
-                        frac *= max(0.25, min(1.0, conf["multiplier"]))
-                        sh = int((frac * equity) // price)
-                        if sh > 0:
-                            intent = dict(intent, shares=sh * sig["direction"],
-                                          fraction=frac, notional=sh * price)
+                    candidates.append({
+                        "symbol": sym, "direction": sig["direction"],
+                        "price": price, "score": sig["score"], "bucket": bucket,
+                        "mu": float(bstats.get("mu", 0.0)),
+                        "sigma": float(bstats.get("sigma", 0.0)),
+                        "n": int(bstats.get("n", 0)),
+                        "symbol_vol": symbol_vol,
+                        "confirmation": combined_mult,
+                        "conf_mult": conf["multiplier"],
+                        "fund_score": fscore,
+                        "sig": sig,
+                    })
 
-                    if mode == "OBSERVE" or intent["shares"] == 0:
-                        log.info("  [obs] %-5s dir=%+d score=%+.2f conf=%.2f vol=%.3f "
-                                 "bucket=%s t=%+.2f mu_lcb=%+.5f would_size=%d",
-                                 sym, sig["direction"], sig["score"], conf["multiplier"],
-                                 symbol_vol, bucket, intent["bucket_t"],
-                                 intent["mu_lcb"], intent["shares"])
-                        continue
-
-                    approved, gate = rm.gate_entry(sym, intent["shares"], price,
-                                                   positions, equity, action)
-                    if approved == 0:
-                        log.info("  [gate] %-5s blocked: %s (news=%s)", sym, gate, reason)
-                        continue
-
-                    side = place_entry_with_stop(tc, rm, sym, approved, price, sig)
-                    positions[sym] = {"shares": approved, "price": price}
-                    entry_times[sym] = now
-                    log.info("  [ORDER] %-5s %s %d @ ~%.2f frac=%.3f vol=%.3f "
-                             "score=%+.2f t=%+.2f",
-                             sym, side.value, abs(approved), price,
-                             intent["fraction"], symbol_vol, sig["score"],
-                             intent["bucket_t"])
-                    log_trade(ts_utc=now.isoformat(), session_date=str(session_date),
-                              symbol=sym, action="ENTER", direction=sig["direction"],
-                              shares=approved, price=price, score=sig["score"],
-                              bucket=bucket, mu_lcb=intent["mu_lcb"],
-                              bucket_t=intent["bucket_t"], fraction=intent["fraction"],
-                              symbol_vol=symbol_vol, conf_mult=conf["multiplier"],
-                              gate=("PLUMBING_TEST" if config.PLUMBING_TEST
-                                    and intent["bucket_t"] < config.MIN_BUCKET_T
-                                    else gate))
                 except Exception as e:
                     log.warning("  %s error: %s", sym, e)
+
+            # ---------- entries: PASS 2, joint allocation -------------------
+            # merton_alloc.allocate_book sizes every qualifying candidate in ONE
+            # decision instead of first-come-first-served. It applies the exact
+            # same gates as the per-symbol sizer (MIN_BUCKET_N, MIN_BUCKET_T,
+            # mu_lcb > 0) -- what changes is only how the risk budget is
+            # DISTRIBUTED among names that already qualify, and that the gross
+            # cap scales everyone proportionally rather than starving whoever
+            # happens to be last in the universe list.
+            #
+            # This module has been in the repo unused since it was written;
+            # nothing imported it, so the pathology it was built to fix was live
+            # the whole time.
+            if candidates and mode == "TRADE" and not entries_halted:
+                try:
+                    allocs = alloc.allocate_book(
+                        candidates, equity,
+                        gross_target=max(0.0, config.MAX_GROSS_EXPOSURE
+                                         - current_gross(positions) / max(equity, 1.0)),
+                        enforce_gates=not config.PLUMBING_TEST)
+                except Exception as e:
+                    log.error("ALLOC | allocate_book failed: %s", e)
+                    allocs = []
+
+                by_sym = {c["symbol"]: c for c in candidates}
+
+                if config.PLUMBING_TEST:
+                    # Plumbing mode bypasses the Merton EDGE gate (mu_lcb is not
+                    # positive, so allocate_book returns zeros). Size on the
+                    # signal's own |score| instead, then let the SAME joint
+                    # normaliser divide the remaining gross budget. This is
+                    # confidence-proportional, NOT edge-proportional: loud is not
+                    # profitable, and P&L from this mode carries no information
+                    # about whether the strategy works.
+                    lo = config.ENTRY_THRESHOLD
+                    raw = {}
+                    for c in candidates:
+                        conviction = min(1.0, max(0.0,
+                            (abs(c["score"]) - lo) / max(1e-9, 1.0 - lo)))
+                        f = (config.PLUMBING_FRACTION_MIN + conviction *
+                             (config.PLUMBING_FRACTION - config.PLUMBING_FRACTION_MIN))
+                        raw[c["symbol"]] = f * max(0.25, min(1.0, c["confirmation"]))
+                    room = max(0.0, config.MAX_GROSS_EXPOSURE
+                               - current_gross(positions) / max(equity, 1.0))
+                    total = sum(raw.values())
+                    k = (room / total) if (total > room and total > 0) else 1.0
+                    allocs = []
+                    for c in candidates:
+                        w = min(raw[c["symbol"]] * k, config.MAX_FRACTION)
+                        sh = int((w * equity) // c["price"])
+                        allocs.append({"symbol": c["symbol"], "direction": c["direction"],
+                                       "fraction": w, "shares": sh * c["direction"],
+                                       "bucket_t": 0.0, "mu_lcb": 0.0,
+                                       "gate": "PLUMBING_TEST"})
+
+                placed = 0
+                for a in sorted(allocs, key=lambda r: -abs(r["fraction"])):
+                    if a["shares"] == 0:
+                        continue
+                    c = by_sym.get(a["symbol"])
+                    if c is None:
+                        continue
+                    sym, price = a["symbol"], c["price"]
+
+                    approved, gate = rm.gate_entry(sym, a["shares"], price,
+                                                   positions, equity, action)
+                    if approved == 0:
+                        log.info("  [gate] %-5s blocked: %s", sym, gate)
+                        continue
+                    # A cap that shaves an allocation to a token position is not
+                    # a smaller version of the trade -- it is a full round trip
+                    # of cost on an economically meaningless stake. Skip it.
+                    if abs(approved) * price < config.MIN_ENTRY_NOTIONAL:
+                        log.info("  [gate] %-5s skipped: notional $%.0f below "
+                                 "MIN_ENTRY_NOTIONAL $%.0f (%s)", sym,
+                                 abs(approved) * price,
+                                 config.MIN_ENTRY_NOTIONAL, gate)
+                        continue
+
+                    try:
+                        side = place_entry_with_stop(tc, rm, sym, approved,
+                                                     price, c["sig"])
+                    except Exception as e:
+                        log.warning("  %s entry failed: %s", sym, e)
+                        continue
+                    positions[sym] = {"shares": approved, "price": price}
+                    entry_times[sym] = now
+                    placed += 1
+                    log.info("  [ORDER] %-5s %s %d @ ~%.2f frac=%.3f vol=%.3f "
+                             "score=%+.2f fund=%s t=%+.2f",
+                             sym, side.value, abs(approved), price,
+                             a["fraction"], c["symbol_vol"], c["score"],
+                             "n/a" if c["fund_score"] is None
+                             else f"{c['fund_score']:+.2f}", a["bucket_t"])
+                    log_trade(ts_utc=now.isoformat(),
+                              session_date=str(session_date), symbol=sym,
+                              action="ENTER", direction=c["direction"],
+                              shares=approved, price=price, score=c["score"],
+                              bucket=c["bucket"], mu_lcb=a["mu_lcb"],
+                              bucket_t=a["bucket_t"], fraction=a["fraction"],
+                              symbol_vol=c["symbol_vol"],
+                              conf_mult=c["conf_mult"], gate=a.get("gate", gate))
+                if placed:
+                    save_entry_times(entry_times)
+                    log.info("ALLOC | %d candidates -> %d entries | gross now %.1f%%",
+                             len(candidates), placed,
+                             100.0 * current_gross(positions) / max(equity, 1.0))
+            elif candidates:
+                log.info("  [obs] %d candidates collected, no entries (mode=%s "
+                         "halted=%s)", len(candidates), mode, entries_halted)
 
             time.sleep(OPEN_POLL_SECONDS)
 
