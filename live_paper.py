@@ -53,6 +53,7 @@ import trend_signals as ts
 import factors as fac
 import fundamentals as fund
 import merton_alloc as alloc
+import supabase_mirror as mirror
 import merton
 import news_overlay as no
 import data_feed as feed
@@ -331,8 +332,13 @@ def save_entry_times(entry_times: dict) -> None:
 
 
 def log_trade(**row):
-    """Append one order event. Schema mirrors the backtest trade record so the
-    Welch/Levene/KS comparison is apples-to-apples."""
+    """Append one order event to the local CSV AND to Supabase.
+
+    Both, deliberately. The CSV feeds the Welch/Levene/KS diagnostics and lives
+    on the Railway volume; the mirror makes the same events queryable without
+    shelling into the container. The mirror is best-effort and never raises.
+    """
+    mirror.push_trade(**row)
     path = config.LIVE_TRADES_PATH
     exists = os.path.exists(path)
     try:
@@ -362,6 +368,7 @@ def load_stats_and_universe(dc):
         # cleared MIN_EDGE_RATIO", and the old `or` read that as "field missing,
         # trade everything". The screen inverted exactly when it should have been
         # most restrictive. Distinguish absent (None) from empty ([]).
+        sel = payload.get("selection") or {}
         t = payload.get("tradeable")
         if t is None:
             tradeable = set(universe)
@@ -369,7 +376,6 @@ def load_stats_and_universe(dc):
                         "%d universe symbols as eligible", len(universe))
         else:
             tradeable = set(t)
-            sel = payload.get("selection") or {}
             if sel:
                 log.info("SELECTION | threshold %+.4f (%s) measured over N=%s "
                          "symbols at alpha=%s | %d tradeable",
@@ -383,11 +389,11 @@ def load_stats_and_universe(dc):
                             sel.get("edge_threshold", config.MIN_EDGE_RATIO),
                             sel.get("n_tested", "?"))
         return (stats, universe, tradeable, payload.get("generated_at"),
-                per_symbol)
+                per_symbol, sel)
     except FileNotFoundError:
         universe = feed.select_universe(
             dc, config.CANDIDATE_POOL, config.UNIVERSE_SIZE) or config.UNIVERSE
-        return None, universe, set(universe), None, {}
+        return None, universe, set(universe), None, {}, {}
 
 
 def stats_are_stale(generated_at, session_date) -> bool:
@@ -509,7 +515,7 @@ def run():
             time.sleep(wait)
 
     session_date = session_date_of(clock)
-    stats, universe, tradeable, generated_at, per_symbol = \
+    stats, universe, tradeable, generated_at, per_symbol, selection = \
         load_stats_and_universe(dc)
     mode = "TRADE" if stats else "OBSERVE"
     equity = float(acct.equity)
@@ -517,6 +523,8 @@ def run():
     breaker_cooldown = 0
     halt_announced = False
     budget = CycleBudget(config.CYCLE_TIME_BUDGET_SEC, config.UNIVERSE_HARD_CAP)
+    gate_counts_last = {}
+    selection = {}
     # Persisted: positions now live for days, so this must survive both
     # restarts and rollovers. Inherited positions with no record get their clock
     # started at first sighting, which is conservative -- it can only delay a
@@ -587,8 +595,8 @@ def run():
                                   "(keeping previous cache)", e)
 
                 if maybe_refresh_stats(clock, session_date, generated_at):
-                    stats, universe, tradeable, generated_at, per_symbol = \
-                        load_stats_and_universe(dc)
+                    stats, universe, tradeable, generated_at, per_symbol, \
+                        selection = load_stats_and_universe(dc)
                     mode = "TRADE" if stats else "OBSERVE"
                     log.info("STATS | reloaded | mode=%s universe=%d tradeable=%d "
                              "generated=%s", mode, len(universe), len(tradeable),
@@ -648,6 +656,13 @@ def run():
 
             protected = open_order_symbols(tc)
             candidates = []          # PASS 1 fills this; PASS 2 allocates it
+            # Why the book is flat is the question that actually gets asked, and
+            # "nothing cleared the edge bar" vs "the fundamentals cache is empty"
+            # look identical from outside. Count the reasons.
+            gate_counts = {"no_direction": 0, "not_tradeable": 0, "stale": 0,
+                           "fund_blocked": 0, "fund_unscored": 0,
+                           "candidates": 0, "risk_blocked": 0,
+                           "min_notional": 0, "truncated": 0, "entered": 0}
             sweep_t0 = time.perf_counter()
 
             # ---------- volatility circuit breaker (with hysteresis) --------
@@ -675,6 +690,29 @@ def run():
                      mode, f"{equity:,.2f}", len(positions), breaker,
                      f" (cooldown {breaker_cooldown})" if breaker_cooldown else "",
                      rm.halt_latched, age)
+
+            sel = (selection or {})
+            mirror.push_status(
+                updated_at=now.isoformat(), mode=mode,
+                session_date=str(session_date), equity=round(equity, 2),
+                positions_count=len(positions),
+                universe_size=len(universe), swept_size=len(swept),
+                tradeable_size=len(tradeable),
+                gross_pct=round(100.0 * current_gross(positions)
+                                / max(equity, 1.0), 2),
+                breaker=bool(breaker), halt_latched=bool(rm.halt_latched),
+                bar_age_sec=round(age, 1),
+                stats_generated_at=generated_at,
+                ms_per_symbol=round(1000.0 * (budget.per_symbol or 0), 1),
+                min_adv=config.required_min_adv(equity),
+                edge_threshold=sel.get("edge_threshold"),
+                threshold_source=sel.get("source"),
+                n_tested=sel.get("n_tested"),
+                fund_scored=len(fund.eligible(fundamentals)),
+                fund_generated_at=(fundamentals or {}).get("generated_at"),
+                plumbing_test=bool(config.PLUMBING_TEST),
+                hold_days=config.MAX_HOLD_CALENDAR_DAYS,
+                gate_counts=gate_counts_last)
 
             action, reason = (no.news_risk_action({}, True) if breaker
                               else (NORMAL, "clear"))
@@ -717,10 +755,11 @@ def run():
                                 entry_times[sym] = now      # inherited; start clock
                             elif (now - t0).total_seconds() >= MAX_HOLD_SEC:
                                 if close_position_safely(tc, sym):
-                                    log.info("  [MAXHOLD] %-5s closed after %.0f min "
-                                             "(cap %d bars) score=%+.2f", sym,
-                                             (now - t0).total_seconds() / 60,
-                                             config.MAX_HOLD_BARS, sig["score"])
+                                    log.info("  [MAXHOLD] %-5s closed after "
+                                             "%.1f days (cap %d) score=%+.2f", sym,
+                                             (now - t0).total_seconds() / 86400,
+                                             config.MAX_HOLD_CALENDAR_DAYS,
+                                             sig["score"])
                                     log_trade(ts_utc=now.isoformat(),
                                               session_date=str(session_date), symbol=sym,
                                               action="MAXHOLD", direction=held_dir,
@@ -747,12 +786,15 @@ def run():
                     # tail of it is one-share noise paying full round-trip cost.
                     # Collect first, allocate jointly below.
                     if sig["direction"] == 0:
+                        gate_counts["no_direction"] += 1
                         continue
                     if entries_halted:
                         continue        # latched for the session; see above
                     if sym not in tradeable and not config.PLUMBING_TEST:
+                        gate_counts["not_tradeable"] += 1
                         continue
                     if not fresh:
+                        gate_counts["stale"] += 1
                         continue                        # no entries on stale data
 
                     # --- FUNDAMENTAL CONJUNCTION -----------------------------
@@ -765,6 +807,8 @@ def run():
                     fscore = fund.score_for(fundamentals, sym)
                     fgate = fac.fundamental_confirmation(fscore, sig["direction"])
                     if not fgate["allow"]:
+                        gate_counts["fund_unscored" if fscore is None
+                                    else "fund_blocked"] += 1
                         log.debug("  [fund] %-5s blocked: %s (score=%s)",
                                   sym, fgate["reason"],
                                   "None" if fscore is None else f"{fscore:+.3f}")
@@ -794,11 +838,14 @@ def run():
                         "fund_score": fscore,
                         "sig": sig,
                     })
+                    gate_counts["candidates"] += 1
 
                 except Exception as e:
                     log.warning("  %s error: %s", sym, e)
 
             budget.observe(time.perf_counter() - sweep_t0, len(swept))
+            gate_counts_last = dict(gate_counts,
+                                    cycle_sec=round(time.perf_counter() - sweep_t0, 1))
 
             # ---------- entries: PASS 2, joint allocation -------------------
             # merton_alloc.allocate_book sizes every qualifying candidate in ONE
@@ -868,6 +915,7 @@ def run():
                     gross_target=room_frac)
                 n_trunc = sum(1 for a in allocs
                               if a.get("gate") == "truncated_min_notional")
+                gate_counts["truncated"] = n_trunc
                 if n_trunc:
                     log.info("ALLOC | %d candidates truncated: book can fund at "
                              "most %d positions of $%.0f at %.0f%% gross",
@@ -887,12 +935,14 @@ def run():
                     approved, gate = rm.gate_entry(sym, a["shares"], price,
                                                    positions, equity, action)
                     if approved == 0:
+                        gate_counts["risk_blocked"] += 1
                         log.info("  [gate] %-5s blocked: %s", sym, gate)
                         continue
                     # A cap that shaves an allocation to a token position is not
                     # a smaller version of the trade -- it is a full round trip
                     # of cost on an economically meaningless stake. Skip it.
                     if abs(approved) * price < config.MIN_ENTRY_NOTIONAL:
+                        gate_counts["min_notional"] += 1
                         log.info("  [gate] %-5s skipped: notional $%.0f below "
                                  "MIN_ENTRY_NOTIONAL $%.0f (%s)", sym,
                                  abs(approved) * price,
@@ -908,6 +958,7 @@ def run():
                     positions[sym] = {"shares": approved, "price": price}
                     entry_times[sym] = now
                     placed += 1
+                    gate_counts["entered"] += 1
                     log.info("  [ORDER] %-5s %s %d @ ~%.2f frac=%.3f vol=%.3f "
                              "score=%+.2f fund=%s t=%+.2f",
                              sym, side.value, abs(approved), price,
