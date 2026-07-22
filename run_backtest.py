@@ -59,6 +59,7 @@ import config
 import backtest as bt
 import data_feed as feed
 import fundamentals
+import supabase_mirror as mirror
 
 
 def _key(*names):
@@ -263,6 +264,28 @@ def main():
     print(f"\nSelection threshold: {edge_threshold:+.4f} ({threshold_source}, "
           f"N={n_tested}, alpha={config.SELECTION_ALPHA}) -> "
           f"{len(tradeable)} tradeable")
+
+    # merton_research has existed since the mirror was designed and has never
+    # had a writer. This is what it was for: the measured null, the observed
+    # maximum, and whether anything survived the multiplicity correction.
+    _obs = max((per_symbol[s_]["edge_ratio"] for s_ in trades_by_symbol),
+               default=0.0)
+    _p = float((null >= _obs).mean()) if len(null) else None
+    mirror.push_research(
+        ran_at=datetime.now(timezone.utc).isoformat(),
+        session_date=str(datetime.now(timezone.utc).date()),
+        track="selection_bootstrap",
+        best_cell=(max(trades_by_symbol,
+                       key=lambda s_: per_symbol[s_]["edge_ratio"])
+                   if trades_by_symbol else None),
+        observed_max_t=_obs,
+        null_p95=edge_threshold,
+        family_wise_p=_p,
+        cleared=bool(len(tradeable)),
+        cost_bps=2 * (config.SLIPPAGE_BPS + config.SPREAD_BPS),
+        note=(f"N={n_tested} universe={len(universe)} source={threshold_source} "
+              f"iters={args.bootstrap} days={args.days} "
+              f"hold_bars={config.MAX_HOLD_BARS_BACKTEST}"))
 
     # The live loop polls the WHOLE scan pool. Thinning is the job of the
     # entry threshold, the fundamental conjunction, the per-symbol `tradeable`
