@@ -19,6 +19,11 @@ import pandas as pd
 import config
 import indicators as ind
 
+# Bar-indexed holding cap for the simulation. Falls back to the legacy
+# MAX_HOLD_BARS if the newer key is absent, so an old config still runs.
+_MAX_HOLD_BT = getattr(config, "MAX_HOLD_BARS_BACKTEST",
+                       getattr(config, "MAX_HOLD_BARS", 0))
+
 
 # --------------------------------------------------------------------------
 # Vectorised gated score per timeframe (same indicator math as live signals)
@@ -153,9 +158,11 @@ def _simulate(sf: pd.DataFrame, entry_threshold: float, flatten_eod: bool,
             if not exit_now:
                 hwm = max(hwm, h[i]) if pos == 1 else min(hwm, lo[i])
 
-            # max holding time -> exit at next open, regardless of signal
-            if not exit_now and config.MAX_HOLD_BARS and \
-                    (i - entry_i) >= config.MAX_HOLD_BARS:
+            # max holding time -> exit at next open, regardless of signal.
+            # Uses MAX_HOLD_BARS_BACKTEST (bar-indexed) rather than the live
+            # wall-clock cap, but the two are calibrated to the same horizon.
+            if not exit_now and _MAX_HOLD_BT and \
+                    (i - entry_i) >= _MAX_HOLD_BT:
                 exit_now, exit_px, kind = True, o[i + 1] * (1 - pos * cost), "max_hold"
 
             # signal exit
