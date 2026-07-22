@@ -94,3 +94,51 @@ def confirmation(df: pd.DataFrame, direction: int) -> dict:
     return {"multiplier": mult, "flags": flags,
             "metrics": {"rsi": round(r, 1), "pctb": round(pctb, 2),
                         "mfi": round(m, 1), "bandwidth": round(bw, 4)}}
+
+
+def fundamental_confirmation(fund_score, direction: int) -> dict:
+    """CONJUNCTION gate on the SEC-derived composite. Returns {allow, multiplier, reason}.
+
+    Deliberately a hard gate rather than a weighted blend. A blend lets a loud
+    technical score outvote a bad balance sheet, which defeats the entire point
+    of adding an orthogonal source: the value is in requiring AGREEMENT between
+    two independent measurements, not in averaging them into one mushy number.
+
+    So: long needs the composite above FUND_LONG_MIN, short needs it below
+    FUND_SHORT_MAX, and the magnitude of the agreement then scales size between
+    FUND_MULT_FLOOR and 1.0.
+
+    An unscored symbol (ETF, trust, ADR share class, or any filer whose XBRL is
+    too sparse for FUND_MIN_FAMILIES) is REFUSED when FUND_REQUIRE_SCORE is on.
+    Treating "unknown" as "neutral" would quietly re-admit exactly the ETFs this
+    is meant to keep out -- and QQQ, SMH and SOXX sitting alongside AVGO, LRCX,
+    KLAC, MU and ASML is one semiconductor bet held eleven times, which collapses
+    the effective sample size the significance gate depends on.
+    """
+    import config
+
+    if not config.USE_FUNDAMENTAL_GATE:
+        return {"allow": True, "multiplier": 1.0, "reason": "gate_off",
+                "score": fund_score}
+
+    if direction == 0:
+        return {"allow": False, "multiplier": 0.0, "reason": "no_direction",
+                "score": fund_score}
+
+    if fund_score is None:
+        allow = not config.FUND_REQUIRE_SCORE
+        return {"allow": allow, "multiplier": 1.0 if allow else 0.0,
+                "reason": "no_fundamentals", "score": None}
+
+    if direction == 1 and fund_score <= config.FUND_LONG_MIN:
+        return {"allow": False, "multiplier": 0.0,
+                "reason": "fund_disagrees_long", "score": fund_score}
+    if direction == -1 and fund_score >= config.FUND_SHORT_MAX:
+        return {"allow": False, "multiplier": 0.0,
+                "reason": "fund_disagrees_short", "score": fund_score}
+
+    floor = config.FUND_MULT_FLOOR
+    strength = min(1.0, abs(float(fund_score)))
+    return {"allow": True,
+            "multiplier": floor + (1.0 - floor) * strength,
+            "reason": "fund_confirms", "score": fund_score}
