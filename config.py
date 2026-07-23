@@ -284,7 +284,7 @@ MARKET_TZ = "America/New_York"
 # of ~195. Bucket n collapses below MIN_BUCKET_N=100 and every bucket sizes to
 # zero for want of sample, not for want of edge. Longer holds REQUIRE a longer
 # window to estimate the same distribution to the same precision.
-BACKTEST_DAYS = 400
+BACKTEST_DAYS = 60
 STATS_REFRESH_START_ET = "08:00"   # nightly refresh window (pre-open)
 STATS_REFRESH_END_ET = "09:20"
 MAX_BAR_STALENESS_SEC = 900   # during RTH, no fresh bar in this long -> no entries
