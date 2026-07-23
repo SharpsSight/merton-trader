@@ -487,6 +487,26 @@ def bars_are_fresh(frames, universe, now_utc):
 
 
 # ---------------------------------------------------------------------------
+def _build_fundamentals(dc, universe, log):
+    """Fetch prices, then rebuild the SEC fundamentals cache. Returns the
+    payload, or None on failure.
+
+    Shared by the cold-start path and the weekly market-closed refresh so the
+    two can never drift apart. ~50-100 sequential SEC calls; minutes of wall
+    time. Callers are responsible for only invoking this when that is safe.
+    """
+    px = {}
+    try:
+        fr = feed.fetch_bars_batch(dc, universe, 5)
+        px = {k: float(v["close"].iloc[-1]) for k, v in fr.items()
+              if v is not None and len(v)}
+    except Exception as e:
+        log.warning("FUNDAMENTALS | price fetch failed: %s "
+                    "(market-cap metrics will be absent)", e)
+    pool = sorted(set(universe) | set(config.CANDIDATE_POOL))
+    return fund.refresh(pool, px, log=log)
+
+
 def run():
     api_key = _key("ALPACA_API_KEY", "APCA_API_KEY_ID")
     secret = _key("ALPACA_SECRET_KEY", "APCA_API_SECRET_KEY")
@@ -531,6 +551,61 @@ def run():
     # max-hold exit, never trigger one early.
     entry_times = load_entry_times()
     fundamentals = fund.load()
+
+    # ---------- cold-start fundamentals -------------------------------------
+    # The weekly refresh lives in the `not clock.is_open` branch because it is
+    # minutes of sequential SEC calls and must never run inside a trading
+    # cycle. But that branch is only reachable by a process that is ALIVE while
+    # the market is shut. A process that dies at the close and is restarted by
+    # hand during the session never reaches it -- so the cache is never built,
+    # fund.load() returns None, eligible() returns the empty set, and
+    # FUND_REQUIRE_SCORE then refuses 100% of entries while exits continue
+    # unaffected. That is a monotonic liquidation, and it is what this system
+    # did until 2026-07-23.
+    #
+    # "No cache at all" and "cache is 8 days old" are different states. Only
+    # the second one can wait for the next closed window. The first must block
+    # here at startup, before the loop, where nothing is trading yet.
+    if config.USE_FUNDAMENTAL_GATE and not fund.eligible(fundamentals):
+        log.warning("FUNDAMENTALS | no usable cache at %s -- cold-building "
+                    "now (blocking). Entries are IMPOSSIBLE until this "
+                    "completes.", config.FUND_CACHE_PATH)
+        try:
+            fundamentals = _build_fundamentals(dc, universe, log)
+        except Exception as e:
+            log.error("FUNDAMENTALS | cold build failed: %s", e)
+
+    # Fail loud, not quiet. An empty cache under FUND_REQUIRE_SCORE does not
+    # mean "trade cautiously", it means "entries are impossible". Left silent
+    # that state is indistinguishable from a flat book, while the exit path
+    # keeps firing and grinds the book to zero one position at a time.
+    if config.USE_FUNDAMENTAL_GATE and config.FUND_REQUIRE_SCORE \
+            and not fund.eligible(fundamentals):
+        rm.trip_kill_switch("no_fundamentals")
+        log.error("=" * 78)
+        log.error("FUNDAMENTALS CACHE EMPTY and FUND_REQUIRE_SCORE=True.")
+        log.error("Every entry will be refused. Kill switch tripped so the")
+        log.error("book is not liquidated one-sided while blind.")
+        log.error("Check SEC reachability and %s", config.FUND_CACHE_PATH)
+        log.error("=" * 78)
+
+    # maybe_refresh_stats() is ALSO gated on `not clock.is_open` plus a narrow
+    # pre-open ET window, so it is unreachable for the same reason. A stale
+    # signal_stats.json silently freezes BOTH mu/sigma and the universe list --
+    # config.UNIVERSE_SIZE changes have no effect until it is regenerated.
+    if generated_at:
+        try:
+            _age = (datetime.now(timezone.utc)
+                    - datetime.fromisoformat(generated_at)).days
+            if _age > 2:
+                log.warning("STATS | signal_stats.json is %d days old (%s). "
+                            "universe=%d is frozen from that run; "
+                            "config.UNIVERSE_SIZE=%d is NOT in effect until "
+                            "run_backtest.py regenerates it.",
+                            _age, generated_at, len(universe),
+                            config.UNIVERSE_SIZE)
+        except (TypeError, ValueError):
+            pass
 
     log.info("=== live_paper starting | mode=%s | equity $%s | universe=%d "
              "| tradeable=%d | session=%s | stats_generated=%s ===",
@@ -580,19 +655,19 @@ def run():
                 # cycle. Quarterly data at a weekly refresh has no staleness cost.
                 if config.USE_FUNDAMENTAL_GATE and fund.is_stale(fundamentals):
                     try:
-                        px = {}
-                        try:
-                            fr = feed.fetch_bars_batch(dc, universe, 5)
-                            px = {k: float(v["close"].iloc[-1])
-                                  for k, v in fr.items()
-                                  if v is not None and len(v)}
-                        except Exception as e:
-                            log.warning("FUNDAMENTALS | price fetch failed: %s", e)
-                        pool = sorted(set(universe) | set(config.CANDIDATE_POOL))
-                        fundamentals = fund.refresh(pool, px, log=log)
+                        fundamentals = _build_fundamentals(dc, universe, log)
                     except Exception as e:
                         log.error("FUNDAMENTALS | refresh failed: %s "
                                   "(keeping previous cache)", e)
+                    # Recovery: if the cache is now populated and the kill
+                    # switch was tripped FOR that reason, release it. Scoped by
+                    # reason so this can never clear a risk-driven kill.
+                    if fund.eligible(fundamentals) and rm.kill_switch \
+                            and rm.kill_reason == "no_fundamentals":
+                        rm.clear_kill_switch()
+                        log.info("FUNDAMENTALS | cache rebuilt (%d scored) -- "
+                                 "kill switch released.",
+                                 len(fund.eligible(fundamentals)))
 
                 if maybe_refresh_stats(clock, session_date, generated_at):
                     stats, universe, tradeable, generated_at, per_symbol, \
