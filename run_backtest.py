@@ -41,6 +41,7 @@ sizer a selection-biased edge estimate. Do not do it.
 """
 
 import os
+import gc
 import sys
 import csv
 import json
@@ -60,6 +61,35 @@ import backtest as bt
 import data_feed as feed
 import fundamentals
 import supabase_mirror as mirror
+
+
+def _stream_bars(dc, symbols, days, chunk=50):
+    """Yield (symbol, DataFrame) a chunk at a time, freeing each chunk after use.
+
+    fetch_bars_batch(dc, <1048 symbols>, 60) issues ONE request whose response
+    the SDK materializes as millions of Bar objects BEFORE .df converts them.
+    That transient peak -- not the DataFrames -- is what the OOM killer sees.
+    On 2026-07-23 the 14:25 run died at symbol ~230 of 1048 with no traceback,
+    no backtest_trades.csv, and no signal_stats.json, leaving the live runner
+    on a stats file from 2026-07-17. Chunking bounds the peak at chunk/N of it.
+    """
+    total = (len(symbols) + chunk - 1) // chunk
+    for i in range(0, len(symbols), chunk):
+        batch = symbols[i:i + chunk]
+        n = i // chunk + 1
+        try:
+            frames = feed.fetch_bars_batch(dc, batch, days)
+        except Exception as e:
+            print(f"[chunk {n}/{total}] fetch FAILED ({e}) -- skipping "
+                  f"{len(batch)} symbols", flush=True)
+            continue
+        print(f"[chunk {n}/{total}] fetched {len(frames)}/{len(batch)}",
+              flush=True)
+        for sym in batch:
+            yield sym, frames.get(sym)
+        frames.clear()
+        del frames
+        gc.collect()
 
 
 def _key(*names):
@@ -159,7 +189,7 @@ def main():
         print(f"Equity ${bt_equity:,.0f} -> min ADV ${min_adv:,.0f} "
               f"(participation cap {config.MAX_PARTICIPATION_OF_ADV:.1%})")
         universe = feed.dynamic_universe(
-            dc, tc, top_n=config.UNIVERSE_HARD_CAP, allowed=allowed,
+            dc, tc, top_n=config.UNIVERSE_SIZE, allowed=allowed,
             min_adv=min_adv)
     else:
         universe = feed.select_universe(dc, config.CANDIDATE_POOL,
@@ -168,15 +198,12 @@ def main():
         print("Universe selection returned nothing; falling back."); universe = config.UNIVERSE
     print(f"Universe ({len(universe)} by dollar-volume): {', '.join(universe)}\n")
 
-    frames = feed.fetch_bars_batch(dc, universe, args.days)
-
     all_trades = []
     per_symbol = {}
     trades_by_symbol = {}
     tradeable = []
-    for sym in universe:
+    for sym, df in _stream_bars(dc, universe, args.days):
         try:
-            df = frames.get(sym)
             if df is None or len(df) < 300:
                 print(f"{sym:6s}: insufficient bars, skipping"); continue
             res = bt.run_backtest(df, flatten_eod=config.FLATTEN_EOD)
@@ -359,11 +386,23 @@ def main():
                       "automatically; nothing to edit.")
 
     # --- exit-rule comparison on the tradeable set (signals built once) -------
+    # Bars are no longer held for the whole universe (see _stream_bars), so
+    # re-fetch just the tradeable names -- normally a handful, often zero. This
+    # block runs AFTER signal_stats.json is written, so a failure here cannot
+    # cost the run its output.
     sfs = {}
-    for sym in tradeable:
-        df = frames.get(sym)
-        if df is not None and len(df) >= 300:
-            sfs[sym] = bt.build_signal_frame(df)
+    if tradeable:
+        try:
+            _tf = feed.fetch_bars_batch(dc, tradeable, args.days)
+        except Exception as e:
+            print(f"exit-rule comparison: refetch failed ({e}); skipping")
+            _tf = {}
+        for sym in tradeable:
+            df = _tf.get(sym)
+            if df is not None and len(df) >= 300:
+                sfs[sym] = bt.build_signal_frame(df)
+        _tf.clear()
+        gc.collect()
 
     variants = {
         "current (2.5% blend)": dict(trail=0.025, sensitive=False),
